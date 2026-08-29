@@ -1,6 +1,13 @@
 # AGENTS.md
 
-本檔是此 Repository 對 AI Coding Agent 的唯一 normative workflow 規範。其他文件衝突時以本檔為準。
+本檔是此 Repository **內**對 AI Coding Agent 的唯一 normative workflow 規範。
+Repository 內的其他文件與本檔衝突時，以本檔為準。
+
+**這不等於「執行中的 agent 只會收到這裡的指令」。** 使用者層級的設定、skills、hooks，
+以及 managed policy、plugin、MCP、session hooks 都可能同時生效，而它們不在版控裡、
+`git clone` 拿不到、換一台機器可能完全不同。Starter 無法控制那些來源，也不對它們做出承諾 ——
+`doctor` 的 `Agent environment provenance` 會列出檔案系統可見的部分，
+但那是可觀測性訊號，不是 enforcement。
 
 ## Source of Truth
 1. 已批准 OpenSpec specs

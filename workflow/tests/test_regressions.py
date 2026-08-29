@@ -2445,6 +2445,107 @@ class RC5Round7SnapshotFidelityTests(unittest.TestCase):
         finally: shutil.rmtree(td,ignore_errors=True)
 
 
+class RC5ProvenanceTests(unittest.TestCase):
+    """使用者層級設定會影響 agent，但不在版控裡。doctor 必須讓它可見，且不得混進 enforcement。
+
+    共同判準：provenance 是**可觀測性訊號**。它不改變 Repository enforcement 的判定 ——
+    把它混進去等於讓 Starter 對它無法驗證的東西下判斷。
+    """
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5prov-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A'],['git','config','core.hooksPath','.githooks'],
+                  ['git','add','-A'],['git','commit','-m','base']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _doctor(self,r,home):
+        """以隔離的 HOME 執行 doctor —— 不讀開發者本機真實的 ~/.claude。"""
+        env=dict(os.environ); env['HOME']=str(home)
+        return subprocess.run(['python3','workflow/bin/workflow_transition.py','doctor'],
+                              cwd=r,env=env,capture_output=True,text=True)
+
+    def test_same_name_user_skill_is_reported_as_warn(self):
+        """同名 skill 是**結構上確定的覆蓋**（managed > user > project），不是語意猜測。"""
+        td,r=self._repo()
+        try:
+            home=td/'home'; us=home/'.claude/skills/git-smart-commit'; us.mkdir(parents=True)
+            (us/'SKILL.md').write_text('---\nname: git-smart-commit\n---\n覆蓋版\n',encoding='utf-8')
+            out=self._doctor(r,home).stdout
+            self.assertIn('WARN',out,out)
+            self.assertIn('git-smart-commit',out,'必須指名是哪一個 skill 被遮蔽\n'+out)
+            self.assertIn('遮蔽',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_provenance_does_not_change_enforcement_verdict(self):
+        """provenance 出現 WARN 時，Repository enforcement 的判定必須完全不受影響。"""
+        td,r=self._repo()
+        try:
+            home=td/'home'; (home/'.claude').mkdir(parents=True)
+            clean=self._doctor(r,home)
+            us=home/'.claude/skills/git-smart-commit'; us.mkdir(parents=True)
+            (us/'SKILL.md').write_text('---\nname: git-smart-commit\n---\n覆蓋版\n',encoding='utf-8')
+            warned=self._doctor(r,home)
+            def enforcement_line(o):
+                return [l for l in o.stdout.splitlines() if l.startswith('Repository enforcement:')]
+            self.assertEqual(enforcement_line(clean),enforcement_line(warned),
+                             'provenance 不得改變 enforcement 判定')
+            self.assertEqual(clean.returncode,warned.returncode,'provenance 不得改變 exit code')
+            self.assertIn('WARN',warned.stdout,'前提：這次必須真的產生 WARN，否則沒測到東西')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_local_settings_file_is_reported(self):
+        """.claude/settings.local.json 未追蹤且優先於共享設定，clone 的人不會有它。"""
+        td,r=self._repo()
+        try:
+            home=td/'home'; (home/'.claude').mkdir(parents=True)
+            (r/'.claude/settings.local.json').write_text('{}',encoding='utf-8')
+            out=self._doctor(r,home).stdout
+            self.assertIn('settings.local.json',out,out)
+            self.assertIn('WARN',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_provenance_does_not_leak_hook_bodies_or_skill_contents(self):
+        """doctor 的輸出常被貼進 issue 與聊天室，不得洩漏憑證與私人設定。"""
+        td,r=self._repo()
+        try:
+            home=td/'home'
+            hd=home/'.claude/hooks'; hd.mkdir(parents=True)
+            (hd/'secret-hook.sh').write_text('#!/bin/sh\nexport TOKEN=sk-SUPERSECRET-VALUE\n',encoding='utf-8')
+            (home/'.claude/settings.json').write_text(
+                '{"env":{"MY_API_KEY":"sk-ANOTHER-SECRET"}}',encoding='utf-8')
+            sk=home/'.claude/skills/personal'; sk.mkdir(parents=True)
+            (sk/'SKILL.md').write_text('私人內容 PRIVATE-SKILL-BODY\n',encoding='utf-8')
+            out=self._doctor(r,home)
+            blob=out.stdout+out.stderr
+            for leaked in ('sk-SUPERSECRET-VALUE','sk-ANOTHER-SECRET','PRIVATE-SKILL-BODY'):
+                self.assertNotIn(leaked,blob,f'輸出洩漏了 {leaked}\n'+blob)
+            self.assertIn('hooks',blob,'仍必須回報「存在使用者 hooks」這件事')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_provenance_states_it_is_not_a_complete_inventory(self):
+        """不得讓人誤以為列完了。看不到的來源必須明講，並指向 /hooks 與 /status。"""
+        td,r=self._repo()
+        try:
+            home=td/'home'; (home/'.claude/rules').mkdir(parents=True)
+            out=self._doctor(r,home).stdout
+            self.assertIn('filesystem inventory',out,out)
+            for src in ('managed policy','session hooks','shell environment'):
+                self.assertIn(src,out,f'必須列出看不到的來源：缺 {src}\n'+out)
+            self.assertIn('/hooks',out,'必須指向能看到實際生效清單的工具')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
 # 必須放在檔案最末端。放在 class 定義之前會讓「直接執行本檔」只跑到當下已定義的少數測試，
 # 卻仍印出 OK —— 那是比沒有測試更危險的假信心。
 if __name__ == "__main__":

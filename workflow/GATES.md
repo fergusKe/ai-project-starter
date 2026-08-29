@@ -220,6 +220,32 @@ Starter **不覆蓋**既有 hook framework（政策不變），但未串接時 `
 `ACTIVE` 不代表不可繞過。`git commit --no-verify`、`HUSKY=0`、直接改 hook 都是本機 hook
 的固有限制，須由政策禁止並由 CI audit 與 PR protection 補強。
 
+**agent 的執行環境不在 Starter 的控制範圍內。** 使用者層級的 `~/.claude/settings.json`、
+skills 與 hooks 會在每一個專案生效，包含裝了 Starter 的專案；它們不在版控裡、
+`git clone` 拿不到、換一台機器可能完全不同。Starter **不宣稱**下列任何一件事：
+
+- fresh clone 能重現完整的 agent 指令環境
+- 專案版控內容是 agent 實際收到的全部指令來源
+- Claude Code 的 hook 是不可繞過的安全邊界
+
+已確認的合成規則（非推測）：多來源的 PreToolUse hook 是**合併**執行、決策優先序為
+`deny > defer > ask > allow`，所以使用者層級的 `allow` **不能**覆蓋專案的 `deny`。
+但 hook 是可執行程式不是純投票 —— 使用者 hook 可以在最終判定為 deny **之前**就產生
+副作用（改檔、改 git config、啟動外部程序），而且 hooks 平行執行，不能依賴順序。
+同名 skill 的優先序是 `managed > user > project`，因此使用者層級的同名 skill
+**會遮蔽**專案版本；`doctor` 對這一項給 WARN。
+
+`doctor` 的 `Agent environment provenance` 是**獨立的可觀測性訊號，不參與
+Repository enforcement 的 ACTIVE/INACTIVE 判定**。兩者問的問題不同：enforcement 問
+「clone 之後 gate 還在不在」，provenance 問「這台機器上還有誰在對 agent 說話」。
+把後者混進前者，等於讓 Starter 對它無法驗證的東西下判斷。
+
+provenance 只做 **filesystem inventory**，不是完整的 effective runtime inventory。
+看不到 managed policy、CLI `--settings`、session hooks、plugin 與 frontmatter 帶的 hooks、
+MCP 與 subagent 碰撞、以及 shell environment。要看實際生效的完整清單，
+用 Claude Code 的 `/hooks` 與 `/status`。輸出刻意不含 hook command 本文、
+環境變數值與 skill 內容 —— doctor 的輸出常被貼進 issue 與聊天室。
+
 串接判定分兩級：
 
 - **靜態命中**（bridge 指令出現在非註解行）只得到 `CHAINED_STATIC`，**不算 active**。

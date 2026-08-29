@@ -8,7 +8,7 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  installation_conflicts,installation_overwrites,installation_preflight,installation_unexpected_changes,staged_state_is_pristine,
  repository_enforcement,enforcement_is_active,GATE_BRIDGE_COMMAND,verification_policy,
  probe_enforcement,probe_head_enforcement,record_probe_receipt,effective_pre_commit_hook,
- ENFORCEMENT_CHAINED_STATIC,profile_resolution)
+ ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
 def die(msg,code):sys.stdout.flush();print(f'ERROR: {msg}',file=sys.stderr);raise SystemExit(code)
@@ -182,6 +182,26 @@ def validate_browser(change):
 def cmd_status(_):
  s=parse_state(STATE)
  for k,v in [('Phase',s.phase),('Project mode',s.project_mode),('Active OpenSpec change',s.active_change),('Spec approved',s.spec_approved),('Test design approved',s.test_design_approved),('Verification passed',s.verification_passed),('Approved by',s.approved_by),('Last updated',s.last_updated),('Implementation allowed (derived)','yes' if s.implementation_allowed else 'no'),('Web status',project_web_status(ROOT))]:print(f'{k}: {v}')
+def _print_provenance():
+ """列出專案版控之外的 agent 指令來源。
+
+ **這是可觀測性訊號，不是 enforcement。** 它不改變上面那行 Repository enforcement 的
+ 判定 —— 兩者問的問題不同：enforcement 問「clone 之後 gate 還在不在」，
+ provenance 問「這台機器上還有誰在對 agent 說話」。把後者混進前者，
+ 等於讓 Starter 對它無法驗證的東西下判斷。
+ """
+ p=agent_environment_provenance(ROOT)
+ if not p['items']:
+  print('Agent environment provenance: NONE_DETECTED（僅就檔案系統可見範圍）')
+ else:
+  print(f"Agent environment provenance: {p['level']}（不影響上方 Repository enforcement 判定）")
+  for it in p['items']:
+   tail=f" — {it['detail']}" if it['detail'] else ''
+   print(f"  [{it['level']}] {it['kind']}: {it['name']}{tail}")
+ print('  註：以上是 filesystem inventory，不是完整的 effective runtime inventory。看不到：'
+       +'、'.join(p['unknowns'])+'。')
+ print('  要看實際生效的完整清單，用 Claude Code 的 /hooks 與 /status。')
+
 def cmd_doctor(_):
  try:parse_state(STATE);schema='OK'
  except Exception as e:schema=f'FAIL: {e}'
@@ -190,7 +210,7 @@ def cmd_doctor(_):
   fd=os.open('/dev/tty',os.O_RDWR);usable=os.isatty(fd);os.close(fd)
   if not usable:reason='/dev/tty 非 TTY'
  except OSError as e:reason=f'/dev/tty 無法開啟: {e}'
- print(f'STATE schema: {schema}');print(f'stdin is TTY: {"YES" if stdin else "NO"}');print(f'/dev/tty usable: {"YES" if usable else "NO"}');print(f'approve-* 可在此環境執行: {"YES" if stdin and usable else "NO"}'+(f'（{reason or "stdin 非 TTY"}）' if not(stdin and usable) else ''));_print_enforcement();_print_web_tooling();print(f'git: {"OK" if shutil.which("git") else "MISSING"}');print(f'python3: {"OK" if shutil.which("python3") else "MISSING"}');print(f'OpenSpec CLI: {"OK" if shutil.which("openspec") else "MISSING（選用；transition 不依賴它）"}');print('注意：TTY 是已驗證 execution boundary，不是 cryptographic human identity。')
+ print(f'STATE schema: {schema}');print(f'stdin is TTY: {"YES" if stdin else "NO"}');print(f'/dev/tty usable: {"YES" if usable else "NO"}');print(f'approve-* 可在此環境執行: {"YES" if stdin and usable else "NO"}'+(f'（{reason or "stdin 非 TTY"}）' if not(stdin and usable) else ''));_print_enforcement();_print_provenance();_print_web_tooling();print(f'git: {"OK" if shutil.which("git") else "MISSING"}');print(f'python3: {"OK" if shutil.which("python3") else "MISSING"}');print(f'OpenSpec CLI: {"OK" if shutil.which("openspec") else "MISSING（選用；transition 不依賴它）"}');print('注意：TTY 是已驗證 execution boundary，不是 cryptographic human identity。')
 def cmd_set_mode(a):
  s=parse_state(STATE)
  if s.phase!='DISCOVERY':die('set-mode 只允許 DISCOVERY',33)

@@ -943,6 +943,105 @@ def profile_resolution(root:Path):
     return unresolved, resolved, (h.hexdigest() if not unresolved else None)
 
 
+PROVENANCE_INFO='INFO'
+PROVENANCE_WARN='WARN'
+
+
+def _user_claude_dir():
+    return Path(os.path.expanduser('~'))/'.claude'
+
+
+def effective_git_hooks_path(root:Path):
+    """git 在**目前 process 環境下**回報的 core.hooksPath 與它的來源。
+
+    不要只讀 .git/config：使用者全域 config、`GIT_CONFIG_*` 環境介面、
+    以及任何跑過 `git config` 的 hook 都可能改變它。這裡問的是 git 自己。
+    """
+    v = subprocess.run(['git','-C',str(root),'config','--get','core.hooksPath'],
+                       capture_output=True, text=True)
+    if v.returncode != 0 or not v.stdout.strip():
+        return None, None
+    src = subprocess.run(['git','-C',str(root),'config','--show-origin','--get','core.hooksPath'],
+                         capture_output=True, text=True)
+    origin = src.stdout.split('\t')[0].strip() if src.returncode == 0 and '\t' in src.stdout else '<未知來源>'
+    return v.stdout.strip(), origin
+
+
+def agent_environment_provenance(root:Path)->dict:
+    """列出**專案版控之外**、但會影響 agent 行為的指令來源。
+
+    這是**可觀測性訊號，不是 enforcement**。它不改變 Repository enforcement 的
+    ACTIVE/INACTIVE —— 那兩件事的權威來源不同：enforcement 問的是「clone 之後 gate
+    還在不在」，provenance 問的是「這台機器上還有誰在對 agent 說話」。
+    把後者混進前者，等於讓 Starter 對它無法驗證的東西下判斷。
+
+    **本函式只做 filesystem inventory，不是完整的 effective runtime inventory。**
+    看不到的來源列在回傳的 `unknowns`：managed policy、CLI `--settings`、
+    session hooks、plugin 與 skill/agent frontmatter 帶的 hooks、MCP、subagents、
+    以及執行中的 shell environment。
+
+    輸出刻意**不含** hook command 本文、環境變數值與 skill 內容 ——
+    那些可能含憑證與私人設定，doctor 的輸出常被貼進 issue 與聊天室。
+    """
+    items, level = [], None
+    u = _user_claude_dir()
+
+    def add(lv, kind, name, detail=''):
+        nonlocal level
+        items.append({'level': lv, 'kind': kind, 'name': name, 'detail': detail})
+        if lv == PROVENANCE_WARN or level is None:
+            level = lv if lv == PROVENANCE_WARN else (level or lv)
+
+    for rel, kind in (('settings.json','使用者 settings'), ('CLAUDE.md','使用者指令'),
+                      ('rules','使用者 rules'), ('hooks','使用者 hooks'),
+                      ('skills','使用者 skills'), ('plugins','plugins')):
+        q = u/rel
+        if not q.exists():
+            continue
+        detail = ''
+        if q.is_symlink():
+            try: detail = f'symlink → {os.readlink(str(q))}'
+            except OSError: detail = 'symlink → <無法解析>'
+        elif q.is_dir():
+            detail = f'{sum(1 for _ in q.iterdir())} 項'
+        add(PROVENANCE_INFO, kind, rel, detail)
+
+    # 同名 skill 碰撞是**結構上確定的覆蓋**，不是語意猜測：
+    # 官方優先序是 managed > user > project，使用者版本會遮蔽專案版本。
+    proj_skills = root/'.claude/skills'
+    user_skills = u/'skills'
+    if proj_skills.is_dir() and user_skills.is_dir():
+        try:
+            pn = {q.name for q in proj_skills.iterdir() if q.is_dir()}
+            un = {q.name for q in user_skills.iterdir() if q.is_dir()}
+            for name in sorted(pn & un):
+                add(PROVENANCE_WARN, 'skill 覆蓋', name,
+                    '使用者層級同名 skill 會遮蔽專案版本（優先序 managed > user > project）')
+        except OSError:
+            pass
+
+    # 專案本地、未追蹤、但優先於共享 project settings
+    if (root/'.claude/settings.local.json').exists():
+        add(PROVENANCE_WARN, '未追蹤設定', '.claude/settings.local.json',
+            '未進版控且優先於共享的 .claude/settings.json；clone 的人不會有它')
+
+    hp, origin = effective_git_hooks_path(root)
+    if hp is not None:
+        managed = root/MANAGED_HOOK_REL.split('/')[0]
+        try:
+            is_ours = (root/hp).resolve() == managed.resolve()
+        except OSError:
+            is_ours = False
+        if not is_ours:
+            add(PROVENANCE_WARN, 'git hooksPath', hp, f'來源：{origin}')
+
+    unknowns = ['managed policy 與 CLI --settings', 'session hooks',
+                'plugin 與 skill/agent frontmatter 帶的 hooks',
+                'MCP server 與 subagent 的名稱碰撞', '執行中的 shell environment']
+    return {'level': level or PROVENANCE_INFO if items else None,
+            'items': items, 'unknowns': unknowns}
+
+
 def verification_policy(root:Path)->dict:
     """回傳 core verification 政策。未指定時預設 auto（向後相容）。"""
     raw = _profile_field(root, 'Core verification policy') or 'auto'
