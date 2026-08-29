@@ -1,0 +1,16 @@
+# v1.0 shipped roots. One repo-relative path per line; directory entries end with /.
+workflow/
+.claude/
+.githooks/
+openspec/
+templates/
+prompts/
+docs/
+AGENTS.md
+CLAUDE.md
+CONTEXT.md
+PROJECT-PROFILE.md
+README.md
+SETUP.md
+START-HERE.md
+.gitignore

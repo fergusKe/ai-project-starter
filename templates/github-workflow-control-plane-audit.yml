@@ -1,0 +1,27 @@
+name: Control Plane Audit
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  control-plane-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Audit Control Plane history
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${GITHUB_BASE_REF:-}" ]]; then
+            BASE="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
+          else
+            BASE="$(git rev-parse HEAD^)"
+          fi
+          python3 workflow/bin/audit-control-plane.py "$BASE" HEAD

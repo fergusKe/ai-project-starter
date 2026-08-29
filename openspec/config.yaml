@@ -1,0 +1,55 @@
+schema: spec-driven
+
+# Repository-wide context shown to AI when creating OpenSpec artifacts.
+# Keep this synchronized with stable repository facts and CONTEXT.md.
+context: |
+  ## Product
+  - Name: <fill during discovery>
+  - Purpose: <fill during discovery>
+  - Primary users: <fill during discovery>
+
+  ## Tech Stack
+  - <detect/fill after repository initialization>
+
+  ## Domain
+  - Authoritative terminology lives in `CONTEXT.md`.
+  - Architectural decisions live in `docs/adr/`.
+
+  ## Architecture / Engineering Constraints
+  - OpenSpec is the product/behavior source of truth.
+  - Superpowers is used for engineering execution, not competing product specs.
+  - Prefer bounded changes over monolithic proposals.
+
+  ## Security / Data Safety
+  - Never use production data for automated tests.
+  - Destructive integration tests require a clearly isolated test target.
+  - Authorization and data-visibility behavior must be explicit in specs when relevant.
+
+  ## Testing / Verification
+  - Important requirements must map to test cases or explicit verification steps before implementation.
+  - Tests passing alone does not prove requirement compliance.
+  - Before completion verify lint/static checks, typecheck, tests, build and runtime behavior as applicable.
+
+  ## Writing Conventions
+  - Write project artifacts in the language used by the project/team unless the user requests otherwise.
+  - Requirements should be explicit and testable.
+  - Design decisions should include rationale and meaningful alternatives when trade-offs matter.
+  - Proposals should include non-goals.
+
+  ## Repository-level Non-goals
+  - <fill during discovery>
+
+rules:
+  proposal:
+    - Explain why the change is needed, what changes, capabilities affected, impact and explicit non-goals.
+    - Identify dependencies, environment variables, migrations, routes/interfaces and testing impact when relevant.
+  design:
+    - Record context, goals/non-goals, consequential decisions, rationale, alternatives and risks.
+    - Make authorization, ownership, migration and concurrency behavior explicit when relevant.
+  tasks:
+    - Break work into coherent, independently verifiable units that trace to capabilities/spec requirements.
+    - Include tests and migration/shared-contract updates in the same capability where relevant.
+  spec:
+    - Use explicit Requirement/Scenario structure where supported.
+    - Prefer Given/When/Then scenarios for observable behavior.
+    - Include negative/error/authorization scenarios where relevant.

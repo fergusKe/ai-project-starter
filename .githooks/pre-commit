@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+python3 ./workflow/bin/check-implementation-gate.py --staged
+bash ./workflow/bin/verify.sh --pre-commit

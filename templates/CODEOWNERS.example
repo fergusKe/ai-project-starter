@@ -1,0 +1,7 @@
+# Replace @YOUR_TEAM with a real GitHub user/team before enabling.
+/workflow/bin/ @YOUR_TEAM
+/.claude/ @YOUR_TEAM
+/.githooks/ @YOUR_TEAM
+/workflow/STATE.md @YOUR_TEAM
+/workflow/state-log.md @YOUR_TEAM
+/workflow/GATES.md @YOUR_TEAM
