@@ -369,6 +369,64 @@ Browser Gate**。有正式 vocabulary 的欄位必須做列舉檢查，而且決
 可以隔任意長的時間與任意多的 agent 動作）。只檢查 approval flag 的設計看不到這段期間
 的放寬。舊 STATE 沒有這個欄位時視為未綁定並 fail-closed，要求重新 approve-spec。
 
+**四、綁定是持續不變式，不是一次性關卡。** 上面第三條原本只在 `start-engineering`
+比對一次，那還不夠 —— 實測兩個繞過：
+
+- **已在 ENGINEERING 的舊 STATE**（沒有 `Approved profile digest` 欄位）解析後
+  `profile_digest == 'none'`，但 `implementation_allowed` 仍為 True，產品 commit 照樣
+  放行。它已經越過 `start-engineering`，永遠不會再碰到那次拒絕。
+- **worktree-only 掉包**：批准 `Core verification policy: auto` 並進入 ENGINEERING 後，
+  只在 worktree 改成 `not-applicable`（**不 stage**），`verification-pass` 會產生並接受
+  一份 `Checks executed: 0` / `Outcome: NOT_APPLICABLE` 的 evidence；事後把檔案 restore
+  回去，git 看不到任何 profile mutation。fresh clone 拿到的是批准過的 `auto`，
+  而 archived evidence 是依從未被批准的 `not-applicable` 產生的。
+
+所以判準必須集中成一個 `approved_profile_status(root, state)`，由**每一項批准後能力**
+使用：pre-commit gate（透過 `implementation_authorized`，不能只看
+`implementation_allowed` —— 那是 STATE 內部的推導，看不到 profile 被換掉）、
+`approve-tests`、`start-engineering`、`verification-pass`、`archive`。
+
+`none` 的語意是「**可解析，但不具備任何批准後權限**」，不是「下次 start-engineering
+會擋」。讀取端保持可選是對的（升級不該讓 Control Plane 變成損壞），錯的是後續消費。
+
+**五、evidence 必須自證來歷。**
+
+### validator 的分段順序不是美感問題
+
+`core_evidence_status` 拆成 `_core_evidence_semantics` → `_core_evidence_provenance`
+兩段依序執行。語意先跑（「這份 evidence 宣稱了什麼」），來歷後跑（「該不該相信它」）。
+
+原因是實測出來的：把來歷檢查插在語意檢查**中間**，它會**遮蔽**五條既有的語意
+regression —— 那些測試在到達自己的斷言之前就因為「缺少 digest 欄位」而短路，
+於是它們宣稱在測的東西全部沒被測到。防禦層互相遮蔽在這個專案是反覆出現的失敗模式。
+
+刻意**不**拆成兩個公開函式讓呼叫端自己組合：那會多出一條「有人只呼叫其中一段」的
+未鎖住路徑。兩個呼叫端（`verification-pass`、`archive`）都只呼叫 `core_evidence_status`。
+
+### 來歷這一層需要**隔離型**測試
+
+「竄改 evidence 的 digest 後 archive 會拒絕」**沒有**測到來歷層 —— archive 會先比對
+state-log 記錄的 SHA-256，竄改檔案在那裡就被擋下。突變測試證實：把
+`_core_evidence_provenance` 整個拿掉，或把 digest 比對改成永遠通過，那條測試照樣是綠的。
+
+所以必須有一條直接呼叫 validator、不經過任何會更早開火的層的測試，四種情境都要涵蓋：
+缺欄位、值為 `none`、格式正確但對不上、正確。 core evidence 記錄 `Approved profile digest`，
+validator 比對它與 STATE 的值。理由與第四條的第二個繞過同一件事：產生 evidence 的
+profile 可以在事後被 restore，git 因此看不到任何痕跡 —— evidence 自己不帶來歷的話，
+沒有任何一層能事後判斷它是依哪一份被批准的政策產生的。
+
+**`none` 作為保留哨兵。** `Active OpenSpec change: none` 表示「沒有 active change」，
+所以 `none`（含 `None`／`NONE`）不得作為 change id。允許它會產生自相矛盾的狀態：
+transition 成功、append-only log 追加一筆，但讀取語意認為沒有 change，而 `verify.sh`
+之後又因 `change == none` 拒絕。那筆矛盾永久留在稽核紀錄裡。
+
+> 註：`approved_profile_status` 裡「digest 為 `none`」那個分支，**在安全性上是冗餘的**
+> —— 真 digest 永遠不等於字串 `none`，後面的比對也會擋。突變測試證實拿掉它整組測試
+> 照樣全綠。保留它是為了**診斷**：舊 schema 的使用者需要「請重新執行 approve-spec」
+> 這個可操作的指示，而不是一則寫著「批准時 digest: none」的比對失敗訊息。
+> 因此該鎖的是**訊息內容**，不是擋不擋。這也是一個提醒：冗餘不等於可刪，
+> 但它的測試必須鎖住它真正提供的東西。
+
 ## 測試案例文件的勾選狀態
 
 `workflow/test-cases/<change>.md` 的 `[ ]` / `[x]` 是**給人類閱讀與追蹤用的**，

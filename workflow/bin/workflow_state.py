@@ -52,6 +52,13 @@ def validate_change_id(change:str):
         return 'change 名稱不得為空'
     if change in ('.','..'):
         return f'change 名稱不得為 {change!r}：它是路徑巡訪，不是 change'
+    if change.casefold() == 'none':
+        # `none` 是 `Active OpenSpec change` 的保留哨兵。允許它會產生一個
+        # 自相矛盾的狀態：transition 成功、state-log 追加了一筆，但讀取語意
+        # 認為「沒有 active change」，而 verify.sh 之後又會因為 change == none
+        # 拒絕。那筆矛盾永久留在 append-only 的稽核紀錄裡。
+        # 連 `None`／`NONE` 一起擋掉：對人類讀者而言它們無法區分。
+        return 'change 名稱不得為 `none`：那是「沒有 active change」的保留字'
     if '/' in change or '\\' in change:
         return f'change 名稱不得包含路徑分隔符：{change!r}（必須是單一 path component）'
     if any(ord(c) < 0x20 or ord(c) == 0x7f for c in change):
@@ -1113,6 +1120,53 @@ def profile_resolution(root:Path):
     for name in sorted(resolved):
         h.update(name.encode()+b'\0'+resolved[name].encode()+b'\0')
     return unresolved, invalid, resolved, h.hexdigest()
+
+
+def approved_profile_status(root:Path, state):
+    """**批准後每一項能力的單一共用判準。** 回傳 (ok, reason)。
+
+    為什麼不能只在 `start-engineering` 檢查一次：那是關卡，不是不變式。實測兩個繞過 ——
+
+    1. 已經在 ENGINEERING 的舊 STATE（沒有 `Approved profile digest` 欄位）解析後
+       `profile_digest == 'none'`，但 `implementation_allowed` 仍為 True，產品 commit
+       照樣放行。它永遠不會再碰到 start-engineering 的那次拒絕。
+    2. 批准 `Core verification policy: auto` 之後進入 ENGINEERING，**只在 worktree**
+       把它改成 `not-applicable`（不 stage），`verification-pass` 會產生一份
+       `Checks executed: 0` / `Outcome: NOT_APPLICABLE` 的 evidence 並接受它；
+       事後把檔案 restore 回去，git 看不到任何 profile mutation。
+       fresh clone 拿到的是批准過的 `auto`，而 archived evidence 是依從未被批准的
+       `not-applicable` 產生的。
+
+    所以 `none` 的語意必須是「可解析，但不具備任何批准後權限」，而不是
+    「下次 start-engineering 會擋」。
+    """
+    if getattr(state,'profile_digest','none')=='none':
+        return False, ('STATE 沒有記錄批准時的 PROJECT-PROFILE digest。\n'
+                       '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的\n'
+                       '  profile 就是人類批准過的那一份。請重新執行 approve-spec。')
+    unresolved, invalid, _, current = profile_resolution(root)
+    if unresolved or invalid:
+        return False, ('PROJECT-PROFILE.md 目前無法產生 digest'
+                       f'（未解析：{unresolved or "無"}；非法值：'
+                       f'{[n for n,_,_ in invalid] or "無"}）')
+    if current is None or current != state.profile_digest:
+        return False, ('PROJECT-PROFILE.md 與人類批准的內容不一致。\n'
+                       f'  批准時 digest: {state.profile_digest[:16]}\n'
+                       f'  目前 digest:   {(current or "（無法計算）")[:16]}\n'
+                       '  profile 定案之後要改，必須回 SPECIFICATION 修訂 ADR/OpenSpec '
+                       '並重新 review。')
+    return True, ''
+
+
+def implementation_authorized(root:Path, state):
+    """實作授權 = STATE 的推導值 **且** profile 仍與批准內容相符。回傳 (ok, reason)。
+
+    `implementation_allowed` 只看 phase 與兩個 approval flag，那是 STATE 內部的推導；
+    它看不到 PROJECT-PROFILE 是否已經被換掉。pre-commit gate 必須用這一條。
+    """
+    if not state.implementation_allowed:
+        return False, 'Derived Implementation allowed=no'
+    return approved_profile_status(root, state)
 
 
 PROVENANCE_INFO='INFO'

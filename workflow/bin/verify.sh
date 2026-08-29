@@ -102,6 +102,11 @@ err=validate_change_id(sys.argv[1])
 sys.exit(0) if err is None else (sys.stderr.write("ERROR: STATE 的 Active OpenSpec change 不合法："+err+"\n"),sys.exit(1))' "$change"; then
   exit 32
  fi
+ # evidence 自己帶上「它是依哪一份被批准的 profile 產生的」。少了這一欄，
+ # 一份 archived evidence 無法自證來歷 —— 產生它的 profile 可以在事後被 restore，
+ # git 因此看不到任何 profile mutation。
+ approved_digest="$(grep '^Approved profile digest:' workflow/STATE.md | sed 's/^Approved profile digest:[[:space:]]*//')"
+ [[ -n "$approved_digest" ]] || approved_digest="none"
  outcome="PASS"
  if [[ "$policy" == "not-applicable" ]]; then outcome="NOT_APPLICABLE"; fi
  if [[ $failed -ne 0 ]]; then outcome="FAIL"; fi
@@ -114,6 +119,7 @@ sys.exit(0) if err is None else (sys.stderr.write("ERROR: STATE 的 Active OpenS
    echo "Change: ${change}"
    echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
    echo "Verification policy: ${policy}"
+   echo "Approved profile digest: ${approved_digest}"
    echo "Checks selected: ${selected}"
    echo "Checks executed: ${executed}"
    [[ "$policy" == "not-applicable" ]] && echo "Exception reason: ${exception_reason}"

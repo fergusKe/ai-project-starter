@@ -8,7 +8,7 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  installation_conflicts,installation_overwrites,installation_preflight,installation_unexpected_changes,staged_state_is_pristine,
  repository_enforcement,enforcement_is_active,GATE_BRIDGE_COMMAND,verification_policy,
  probe_enforcement,probe_head_enforcement,effective_pre_commit_hook,
- probe_fingerprint,finalize_probe_receipt,
+ probe_fingerprint,finalize_probe_receipt,approved_profile_status,
  ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance,validate_change_id)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
@@ -107,6 +107,42 @@ def _evidence_field(text,name):
  return m.group(1).strip() if m else None
 
 def core_evidence_status(path,expected_change=None):
+ """evidence 是否可被採用 = **語意有效** 且 **來歷可證**。回傳 (ok, reason)。
+
+ 兩者刻意分成兩段並依此順序：語意回答「這份 evidence 宣稱了什麼」，
+ 來歷回答「該不該相信它」。順序反過來的話，一份「PASS 但零檢查」的 evidence
+ 會先收到「缺少 digest 欄位」，那對使用者沒有幫助；更糟的是來歷檢查會**遮蔽**
+ 所有語意檢查，讓既有的語意 regression 全部在到達它們的斷言之前就短路。
+
+ 兩個呼叫端（verification-pass、archive）都只呼叫這個函式，所以兩段都跑得到。
+ 拆成兩個公開函式讓呼叫端自己組合的話，就會多出一個「有人只呼叫其中一段」的
+ 未鎖住路徑。
+ """
+ ok,why=_core_evidence_semantics(path,expected_change)
+ if not ok:return ok,why
+ return _core_evidence_provenance(path)
+
+def _core_evidence_provenance(path):
+ """evidence 必須自證它依哪一份被批准的 profile 產生。回傳 (ok, reason)。
+
+ 為什麼 evidence 要自己帶這個欄位：產生它的 PROJECT-PROFILE 可以在事後被 restore，
+ git 因此看不到任何 profile mutation。少了這一欄，沒有任何一層能事後判斷一份
+ archived evidence 是依哪一份被批准的政策產生的。
+ """
+ text=path.read_text(encoding='utf-8')
+ ev=_evidence_field(text,'Approved profile digest')
+ if ev is None:
+  return False,'core evidence 沒有 Approved profile digest 欄位；請重新執行 verify.sh --full'
+ if ev=='none':
+  return False,'core evidence 產生時 STATE 沒有批准過的 profile digest；請先完成 approve-spec 再重跑'
+ try:state_digest=parse_state(STATE).profile_digest
+ except ValueError as exc:return False,f'STATE 無法解析：{exc}'
+ if ev!=state_digest:
+  return False,(f'evidence 的 Approved profile digest 是「{ev[:16]}」，'
+                f'與 STATE 的「{state_digest[:16]}」不符')
+ return True,''
+
+def _core_evidence_semantics(path,expected_change=None):
  """語意化 evidence validator（R4）。回傳 (ok, reason)。
 
  PASS 必須 Checks executed >= 1 且 Overall exit code 0；
@@ -263,6 +299,8 @@ def cmd_approve_tests(a):
  if s.phase!='TEST_DESIGN':die('approve-tests 只允許 TEST_DESIGN',42)
  if s.spec_approved!='yes':die('Spec 尚未批准',43)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
+ ok,why=approved_profile_status(ROOT,s)
+ if not ok:die(f'approve-tests 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
  actor=tty_human_confirm('approve-tests',a.change);transition(s,replace(s,test_design_approved='yes',approved_by=actor,last_updated=now_iso()),'approve-tests',actor,'Human approved test design')
 def cmd_start_engineering(a):
  s=parse_state(STATE)
@@ -272,21 +310,18 @@ def cmd_start_engineering(a):
  # 只看 approval flag 不夠。approve-spec 與 start-engineering 之間可以隔任意長的
  # 時間與任意多的 agent 動作；把 `Core verification policy` 改成 not-applicable
  # 這種放寬，在只檢查 flag 的設計下不會被任何人發現。批准綁的是**內容**，不是旗標。
- if s.profile_digest=='none':
-  die('STATE 沒有記錄批准時的 PROJECT-PROFILE digest。\n'
-      '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的 profile\n'
-      '  就是人類批准過的那一份。請重新執行 approve-spec。',44)
- unresolved,invalid,_,current=profile_resolution(ROOT)
- if unresolved or invalid or current!=s.profile_digest:
-  die('PROJECT-PROFILE.md 與 approve-spec 當下人類批准的內容不一致，不得進入 ENGINEERING。\n'
-      f'  批准時 digest: {s.profile_digest[:16]}\n'
-      f'  目前 digest:   {(current or "（無法計算：欄位未解析或有非法值）")[:16]}\n'
-      '  profile 定案之後要改，必須回 SPECIFICATION 修訂 ADR/OpenSpec 並重新 review。',44)
+ ok,why=approved_profile_status(ROOT,s)
+ if not ok:die(why,44)
  transition(s,replace(s,phase='ENGINEERING',last_updated=now_iso()),'start-engineering','machine-verified','Approval prerequisites satisfied; profile digest re-verified')
 def cmd_verification_pass(a):
  s=parse_state(STATE)
  if s.phase not in {'ENGINEERING','VERIFICATION'}:die('verification-pass 只允許 ENGINEERING/VERIFICATION',46)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
+ # 必須在跑 verify.sh **之前**擋。verify.sh 會依當下的 PROJECT-PROFILE 決定要不要
+ # 執行檢查；profile 若已被換成未經批准的 not-applicable，它會產生一份
+ # `Checks executed: 0` 的 evidence，事後把檔案 restore 回去 git 就看不到任何痕跡。
+ ok,why=approved_profile_status(ROOT,s)
+ if not ok:die(f'verification-pass 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
  # 由 verify.sh 明確回報它建立的路徑，不用「前後檔名集合差」——
  # 後者在同一微秒檔名碰撞（覆寫舊檔）時會得到 0 份，並行執行時會得到多份。
  r=subprocess.run(['bash',str(ROOT/'workflow/bin/verify.sh'),'--full'],cwd=ROOT,capture_output=True,text=True)
@@ -318,6 +353,8 @@ def cmd_archive(a):
  s=parse_state(STATE)
  if s.phase!='VERIFICATION' or s.verification_passed!='yes':die('archive 需要 VERIFICATION 且 Verification passed=yes',50)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
+ ok,why=approved_profile_status(ROOT,s)
+ if not ok:die(f'archive 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
  accepted=_accepted_evidence_from_log(a.change)
  if accepted is None:die('state-log 找不到 verification-pass 所接受的 core evidence 記錄；請重跑 verification-pass',51)
  rel,expected=accepted

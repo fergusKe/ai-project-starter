@@ -6,6 +6,7 @@ from workflow_state import (
     parse_state,path_is_control_plane,path_is_ai_writable_non_product,
     state_hash_text,initial_state_hash,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,
     staged_changes,change_touches_control_plane,installation_baseline,installation_unexpected_changes,
+    implementation_authorized,
 )
 STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 STATE_PATH='workflow/STATE.md';LOG_PATH='workflow/state-log.md'
@@ -81,4 +82,9 @@ for c in changes:
     if mutation_product:
         product.append(f'{c.status}: '+(' -> '.join(c.paths) if c.status=='R' else c.paths[0]))
 if state_changed and product:fail('Control Plane transition 與產品程式碼不得同 commit',15)
-if not s.implementation_allowed and product:fail('Derived Implementation allowed=no；blocked:\n  - '+'\n  - '.join(product),12)
+if product:
+    # 不能只看 s.implementation_allowed —— 那是 STATE 內部的推導，看不到
+    # PROJECT-PROFILE 是否已經被換成人類沒批准過的內容。共用判準見
+    # approved_profile_status 的說明（兩個實測繞過）。
+    ok,why=implementation_authorized(ROOT,s)
+    if not ok:fail(why+'；blocked:\n  - '+'\n  - '.join(product),12)

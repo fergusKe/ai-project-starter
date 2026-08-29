@@ -9,6 +9,39 @@ def shipped_roots(src):
     return [line.strip().rstrip('/') for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith('#')]
 
 OWNED=shipped_roots(SRC)
+
+
+def stamp_approved_profile(r):
+    """讓 fixture 進入「profile 已解析且已被人類批准」的狀態，回傳該 digest。
+
+    手工造 evidence 的測試必須用它。core evidence 現在要自證來歷
+    （`Approved profile digest` 必須等於 STATE 的值），所以一份宣稱「合法」的
+    fixture 也必須在**來歷**這一維度上合法 —— 否則測試會退化成
+    「缺欄位的 evidence 被拒」，測不到它原本要測的那件事。
+    """
+    import re as _re, sys as _sys
+    pp=r/'PROJECT-PROFILE.md'; txt=pp.read_text(encoding='utf-8')
+    for k,v in (('Type','CLI'),('Web verification required','no'),
+                ('Primary stack','Python 3.12'),('Package manager','uv'),
+                ('Monorepo','no'),('CI provider','GitHub Actions'),
+                ('Test database strategy','not-applicable')):
+        txt=_re.sub(rf'^{_re.escape(k)}:[ \t]*.*$',f'{k}: {v}',txt,count=1,flags=_re.M)
+    pp.write_text(txt,encoding='utf-8')
+    _sys.path.insert(0,str(r/'workflow/bin'))
+    try:
+        import workflow_state as _W
+        importlib.reload(_W)
+        _,inv,_,dg=_W.profile_resolution(r)
+        assert not inv and dg, f'fixture 的 profile 必須完全解析：{inv}'
+        st=r/'workflow/STATE.md'; s=st.read_text(encoding='utf-8')
+        if 'Approved profile digest:' in s:
+            s=_re.sub(r'^Approved profile digest:.*$',f'Approved profile digest: {dg}',s,flags=_re.M)
+        else:
+            s=s.replace('Last updated:',f'Approved profile digest: {dg}\nLast updated:',1)
+        st.write_text(s,encoding='utf-8')
+    finally:
+        _sys.path.remove(str(r/'workflow/bin'))
+    return dg
 def fixture():
     td=Path(tempfile.mkdtemp(prefix="starter-reg-")); r=td/"repo"; r.mkdir()
     for rel in OWNED:
@@ -852,6 +885,8 @@ class RC5VerificationPolicyTests(unittest.TestCase):
         pp.write_text(pp.read_text(encoding='utf-8').replace('Type: UNKNOWN','Type: CLI').replace('Web verification required: auto','Web verification required: no'),encoding='utf-8')
         st=r/'workflow/STATE.md'
         st.write_text(st.read_text(encoding='utf-8').replace('Active OpenSpec change: none','Active OpenSpec change: demo'),encoding='utf-8')
+        # evidence 現在要自證來歷，所以 fixture 必須有一份「已批准」的 profile digest。
+        self.approved_digest=stamp_approved_profile(r)
         return td,r
 
     def _verify(self,r):
@@ -1025,11 +1060,13 @@ class RC5VerificationPolicyTests(unittest.TestCase):
             ]
             for label,body,expect in cases:
                 text=('# x\nCore evidence schema: 2\nChange: demo\nVerification policy: auto\n'
+                      f'Approved profile digest: {self.approved_digest}\n'
                       +body+'Overall exit code: 0\n')
                 ok,why=self._status(r,text)
                 self.assertFalse(ok,f'{label} 應被拒絕')
                 self.assertIn(expect,why,label)
             good=('# x\nCore evidence schema: 2\nChange: demo\nVerification policy: auto\n'
+                  f'Approved profile digest: {self.approved_digest}\n'
                   'Checks selected: 2\nChecks executed: 2\nExit code: 0\nExit code: 0\nOutcome: PASS\nOverall exit code: 0\n')
             ok,why=self._status(r,good)
             self.assertTrue(ok,f'自洽的 PASS 應被接受：{why}')
@@ -1050,7 +1087,9 @@ class RC5VerificationPolicyTests(unittest.TestCase):
             # 形狀刻意與這個 repo 真正會產生的那一份一致（docs 專案 → not-applicable），
             # 讓偽造檔在「內容合法性」這一維度上與真品無法區分。
             forged.write_text('# forged\nCore evidence schema: 2\nChange: demo\n'
-                              'Verification policy: not-applicable\nChecks selected: 0\nChecks executed: 0\n'
+                              'Verification policy: not-applicable\n'
+                              f'Approved profile digest: {self.approved_digest}\n'
+                              'Checks selected: 0\nChecks executed: 0\n'
                               'Exception reason: 純文件專案，無自動化檢查\n'
                               'Outcome: NOT_APPLICABLE\nOverall exit code: 0\n',encoding='utf-8')
             # 前置斷言：偽造檔本身必須是「完全合法」的 evidence，
@@ -1114,6 +1153,10 @@ class RC5VerificationPolicyTests(unittest.TestCase):
                       .replace('Test design approved: no','Test design approved: yes'),encoding='utf-8')
         d=r/'openspec/changes/demo'; d.mkdir(parents=True,exist_ok=True)
         for n in ('proposal.md','spec.md','tasks.md'): (d/n).write_text(n,encoding='utf-8')
+        # 這個 helper 改了 Core verification policy，而 policy 現在**在 digest 裡面**。
+        # 必須重新蓋章 —— 它模擬的是「人類批准了含 not-applicable 的那一份 profile」，
+        # 不是「批准 A 之後偷偷換成 B」（後者正是新 gate 要擋的東西）。
+        self.approved_digest=stamp_approved_profile(r)
 
 
     def test_archive_rejects_nested_evidence_path(self):
@@ -1497,7 +1540,14 @@ class RC5Round2Tests(unittest.TestCase):
             spec=importlib.util.spec_from_file_location('wt_p14',r/'workflow/bin/workflow_transition.py')
             m=importlib.util.module_from_spec(spec); sys.modules['wt_p14']=m; spec.loader.exec_module(m)
             ev=r/'ev.md'
-            def check(text): ev.write_text(text,encoding='utf-8'); return m.core_evidence_status(ev)
+            # 這一組測的是**語意**分支。evidence 現在還要自證來歷，所以每份手工樣本
+            # 都補上合法的 digest —— 否則測試會退化成「缺欄位被拒」，
+            # 完全測不到 policy 與 Checks selected 的核對。
+            dg=stamp_approved_profile(r)
+            def check(text):
+                text=text.replace('Core evidence schema: 2\n',
+                                  f'Core evidence schema: 2\nApproved profile digest: {dg}\n',1)
+                ev.write_text(text,encoding='utf-8'); return m.core_evidence_status(ev)
 
             ok,why=check('# x\nCore evidence schema: 2\nVerification policy: made-up\n'
                          'Checks executed: 1\nExit code: 0\nOutcome: PASS\nOverall exit code: 0\n')
@@ -2993,6 +3043,258 @@ class RC5Round12Tests(unittest.TestCase):
             self.assertIn('Core verification policy: not-applicable',out,
                           'verification waiver 必須列在人類看得到的確認畫面上\n'+out)
             self.assertIn('skip automated checks',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
+
+class RC5Round13Tests(unittest.TestCase):
+    """Codex 第十三輪：把 profile digest 從「一次性關卡」改成「持續不變式」。
+
+    共同判準：`Approved profile digest: none` 的語意是**可解析，但不具備任何
+    批准後權限**，而不是「下次 start-engineering 會擋」。
+    """
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5r13-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _run(self,r,*args):
+        return subprocess.run(['python3','workflow/bin/workflow_transition.py',*args],
+                              cwd=r,capture_output=True,text=True)
+
+    def _set_profile(self,r,**kv):
+        p=r/'PROJECT-PROFILE.md'; t=p.read_text(encoding='utf-8')
+        for k,v in kv.items():
+            k=k.replace('_',' ')
+            t=re.sub(rf'^{re.escape(k)}:[ \t]*.*$',f'{k}: {v}',t,count=1,flags=re.M)
+        p.write_text(t,encoding='utf-8')
+
+    def _approved_engineering(self,r):
+        """做出一個「已批准 policy=auto、已在 ENGINEERING」的合法狀態。"""
+        self._set_profile(r,Type='API',Web_verification_required='no',
+                          Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
+                          CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+        (r/'openspec/changes/demo').mkdir(parents=True,exist_ok=True)
+        (r/'openspec/changes/demo/proposal.md').write_text('x',encoding='utf-8')
+        (r/'workflow/test-cases').mkdir(parents=True,exist_ok=True)
+        (r/'workflow/test-cases/demo.md').write_text('cases',encoding='utf-8')
+        (r/'package.json').write_text(json.dumps({"scripts":{"test":"echo ok","build":"echo build"}}),
+                                      encoding='utf-8')
+        sys.path.insert(0,str(r/'workflow/bin'))
+        try:
+            import workflow_state as W
+            importlib.reload(W)
+            _,_,_,dg=W.profile_resolution(r)
+            self.assertIsNotNone(dg,'前提：profile 必須完全解析')
+            W.write_state(r/'workflow/STATE.md',
+                          W.WorkflowState('ENGINEERING','GREENFIELD','demo','yes','yes','no',
+                                          'human',W.now_iso(),dg))
+        finally: sys.path.remove(str(r/'workflow/bin'))
+        subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','approved'],
+                       cwd=r,check=True,capture_output=True)
+        return dg
+
+    # ---- Blocker 1：`none` 是保留哨兵 ----------------------------------------
+
+    def test_none_is_rejected_as_change_id(self):
+        """`none` 同時是 `Active OpenSpec change` 的哨兵。允許它會產生自相矛盾的狀態：
+        transition 成功、state-log 追加一筆，但讀取語意認為沒有 active change。
+        """
+        td,r=self._repo()
+        try:
+            for name in ('none','None','NONE'):
+                d=r/'openspec/changes'/name
+                if not d.exists(): d.mkdir(parents=True)
+                (d/'proposal.md').write_text('x',encoding='utf-8')
+                x=self._run(r,'start-change',name)
+                out=x.stdout+x.stderr
+                self.assertEqual(x.returncode,31,f'{name} 必須被拒絕\n'+out)
+                self.assertIn('保留字',out,out)
+            state=(r/'workflow/STATE.md').read_text(encoding='utf-8')
+            self.assertIn('Phase: DISCOVERY',state,'STATE 不得被改動')
+            log=(r/'workflow/state-log.md').read_text(encoding='utf-8')
+            self.assertNotIn('- Action: start-change',log,'append-only log 不得被污染')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 2：digest 必須是持續不變式，不是一次性關卡 --------------------
+
+    def test_old_engineering_state_without_digest_blocks_product_commits(self):
+        """已在 ENGINEERING 的舊 STATE 永遠不會再碰到 start-engineering 的拒絕。
+
+        `implementation_allowed` 只看 phase 與兩個 flag，所以 pre-commit gate
+        原本會放行產品程式碼。
+        """
+        td,r=self._repo()
+        try:
+            # 必須先有 HEAD。gate 對 initial commit 會刻意放行一次，
+            # 沒有 base commit 的話這條測試會因為完全無關的理由通過。
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','base'],
+                           cwd=r,check=True,capture_output=True)
+            p=r/'workflow/STATE.md'; t=p.read_text(encoding='utf-8')
+            t=(t.replace('Phase: DISCOVERY','Phase: ENGINEERING')
+                 .replace('Spec approved: no','Spec approved: yes')
+                 .replace('Test design approved: no','Test design approved: yes')
+                 .replace('Active OpenSpec change: none','Active OpenSpec change: demo'))
+            p.write_text(re.sub(r'^Approved profile digest:.*\n','',t,flags=re.M),encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                s=W.parse_state(p)
+                self.assertTrue(s.implementation_allowed,
+                                '前提：STATE 內部推導仍然是 allowed —— 這正是問題所在')
+                ok,_=W.implementation_authorized(r,s)
+                self.assertFalse(ok,'授權必須同時看 profile binding')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+            (r/'src').mkdir(exist_ok=True)
+            (r/'src/app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','src/app.py'],cwd=r,check=True,capture_output=True)
+            x=subprocess.run(['python3','workflow/bin/check-implementation-gate.py','--staged'],
+                             cwd=r,capture_output=True,text=True)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,'產品 commit 必須被擋\n'+out)
+            self.assertIn('DENY',out,out)
+            self.assertIn('src/app.py',out,'必須列出被擋的檔案')
+            # 訊息本身就是這個分支的價值。安全性上它是冗餘的 —— digest 為 none 時
+            # 後面的比對也會擋（真 digest 永遠不等於字串 'none'）。但舊 schema 的
+            # 使用者需要知道「去重跑 approve-spec」，而不是收到一則寫著
+            # 「批准時 digest: none」的比對失敗訊息。突變測試證實：拿掉這個分支
+            # 而只留比對，六條測試全部照樣綠 —— 所以要鎖的是訊息，不是擋不擋。
+            self.assertIn('重新執行 approve-spec',out,
+                          '舊 schema 必須拿到可操作的指示，不是一則 digest 比對失敗\n'+out)
+            self.assertNotIn('批准時 digest: none',out,
+                             '不得把哨兵值當成一個「曾經批准過的 digest」來顯示\n'+out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_worktree_only_policy_swap_cannot_produce_accepted_evidence(self):
+        """最嚴重的一個：只在 worktree 換掉 policy，不 stage，事後 restore。
+
+        Git gate 看不到任何 profile mutation，但 evidence 是依從未被批准的
+        not-applicable 產生的（Checks executed: 0）。
+        """
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='temporarily skip')
+            x=self._run(r,'verification-pass','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,44,out)
+            self.assertIn('與人類批准的內容不一致',out,out)
+            self.assertFalse((r/'workflow/evidence/demo/core').exists(),
+                             '連 evidence 都不該被產生 —— 檢查必須在跑 verify.sh 之前')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_archive_also_rebinds(self):
+        """archive 是最後一道；它同樣不能只看 flag。"""
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            ok=self._run(r,'verification-pass','demo')
+            self.assertEqual(ok.returncode,0,'前提：誠實路徑通過\n'+ok.stdout+ok.stderr)
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='temporarily skip')
+            x=self._run(r,'archive','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,44,out)
+            self.assertIn('與人類批准的內容不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_evidence_records_and_is_validated_against_approved_digest(self):
+        """evidence 必須自證來歷：產生它的 profile 可以事後被 restore。"""
+        td,r=self._repo()
+        try:
+            dg=self._approved_engineering(r)
+            x=self._run(r,'verification-pass','demo')
+            self.assertEqual(x.returncode,0,x.stdout+x.stderr)
+            ev=sorted((r/'workflow/evidence/demo/core').glob('*.md'))[-1]
+            text=ev.read_text(encoding='utf-8')
+            self.assertIn(f'Approved profile digest: {dg}',text,
+                          'evidence 必須記錄它依哪一份被批准的 profile 產生\n'+text)
+            # 竄改 evidence 的 digest → validator 必須拒絕
+            ev.write_text(text.replace(f'Approved profile digest: {dg}',
+                                       'Approved profile digest: '+('0'*64)),encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_transition as T
+                importlib.reload(T)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+            y=self._run(r,'archive','demo')
+            self.assertNotEqual(y.returncode,0,'digest 對不上的 evidence 不得被接受\n'+y.stdout+y.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_provenance_layer_in_isolation(self):
+        """**隔離測試**：只讓來歷這一層生效。
+
+        原本我以為「竄改 evidence 的 digest 後 archive 會拒絕」測到了這一層 ——
+        並沒有。archive 會先比對 state-log 記錄的 SHA-256，竄改檔案在那裡就被擋下，
+        來歷檢查根本沒跑到。突變測試證實：把 `_core_evidence_provenance` 整個拿掉，
+        或把 digest 比對改成永遠通過，那條測試照樣是綠的。
+
+        所以這裡直接呼叫 validator，不經過任何會更早開火的層。
+        """
+        td,r=self._repo()
+        try:
+            dg=self._approved_engineering(r)
+            ev=r/'ev.md'
+            base=('# x\nCore evidence schema: 2\nVerification policy: auto\n'
+                  'Checks selected: 1\nChecks executed: 1\nExit code: 0\n'
+                  'Outcome: PASS\nOverall exit code: 0\n')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib.util as _iu
+                spec=_iu.spec_from_file_location('wt_prov',r/'workflow/bin/workflow_transition.py')
+                m=_iu.module_from_spec(spec); sys.modules['wt_prov']=m; spec.loader.exec_module(m)
+
+                def check(digest_line):
+                    ev.write_text(base.replace('Core evidence schema: 2\n',
+                                               'Core evidence schema: 2\n'+digest_line,1),
+                                  encoding='utf-8')
+                    return m.core_evidence_status(ev)
+
+                ok,why=check('')
+                self.assertFalse(ok,'缺欄位必須被拒')
+                self.assertIn('沒有 Approved profile digest 欄位',why,why)
+
+                ok,why=check('Approved profile digest: none\n')
+                self.assertFalse(ok,'哨兵值不是一個「批准過的 digest」')
+                self.assertIn('沒有批准過的 profile digest',why,why)
+
+                ok,why=check('Approved profile digest: '+('a'*64)+'\n')
+                self.assertFalse(ok,'digest 對不上必須被拒')
+                self.assertIn('與 STATE 的',why,why)
+
+                ok,why=check(f'Approved profile digest: {dg}\n')
+                self.assertTrue(ok,f'對得上的 evidence 必須被接受：{why}')
+            finally:
+                sys.path.remove(str(r/'workflow/bin'))
+                sys.modules.pop('wt_prov',None)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_honest_flow_still_reaches_archive(self):
+        """對照組。上面幾條若靠「一律拒絕」通過，這條會紅。"""
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            v=self._run(r,'verification-pass','demo')
+            self.assertEqual(v.returncode,0,v.stdout+v.stderr)
+            a=self._run(r,'archive','demo')
+            self.assertEqual(a.returncode,0,a.stdout+a.stderr)
+            self.assertIn('Phase: ARCHIVE',(r/'workflow/STATE.md').read_text(encoding='utf-8'))
         finally: shutil.rmtree(td,ignore_errors=True)
 
 
