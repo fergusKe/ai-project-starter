@@ -19,6 +19,27 @@ CI 是 Verification / Merge Gate 的一部分，但 Starter 不預先綁死某�
 5. Integration/E2E 需要 DB 時，必須使用隔離的測試資料庫。
 6. PR 合併前 required checks 必須通過。
 
+## CI 的形狀要求
+
+上面列的是**涵蓋範圍**，這裡是**形狀**。兩者都要滿足；一個把所有檢查塞進單一
+job 的 workflow 即使涵蓋範圍完整，仍然不合格。
+
+1. **分層（staged）**：便宜且高頻失敗的檢查排在前面（lint、typecheck），昂貴的排
+   後面（integration、E2E、build）。前層失敗時後層不應該還在燒 runner 時間。
+2. **平行（parallel）**：彼此沒有依賴的 job 必須平行跑。「lint 等 typecheck 等
+   unit test」這種串接是浪費，不是分層。
+3. **時間預算**：PR 的 required checks 目標在 **5–10 分鐘**內回覆。超過就要處理
+   （切分、快取、縮小 matrix），而不是接受。這是**目標不是 gate** —— Starter 不
+   會因為 CI 慢而擋 merge，但 AI 建立或修改 CI 時必須報告實測時間。
+4. **Coverage 是 artifact**：coverage 產出必須是可下載的 artifact 或 job summary，
+   不能只存在於 log 裡。**不要**把 coverage 門檻設成 required check，除非人類明確
+   要求 —— 覆蓋率門檻會誘導為了數字而寫的測試。
+
+### 為什麼寫成準則而不是 YAML
+
+Starter 不知道採用者的 stack、runner 數量或既有 workflow。給一份固定 YAML 只會
+被複製後改壞。準則可以被檢查（AI 報告實測時間與 job 圖），YAML 不行。
+
 ## 原則
 
 - 不要從 Starter 複製一份與 Stack 無關的通用 CI。

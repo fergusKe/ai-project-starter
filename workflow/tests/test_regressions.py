@@ -1,4 +1,5 @@
-import json, os, shutil, subprocess, tempfile, unittest
+import importlib, json, os, re, shutil, subprocess, sys, tempfile, unittest
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 
 SRC=Path(__file__).resolve().parents[2]
@@ -2543,6 +2544,455 @@ class RC5ProvenanceTests(unittest.TestCase):
             for src in ('managed policy','session hooks','shell environment'):
                 self.assertIn(src,out,f'必須列出看不到的來源：缺 {src}\n'+out)
             self.assertIn('/hooks',out,'必須指向能看到實際生效清單的工具')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
+
+class RC5Round12Tests(unittest.TestCase):
+    """Codex 第十二輪的三個 blocker。每一條都對應一個實測重現，不是推測。"""
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5r12-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A'],['git','add','-A'],['git','commit','-m','base']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _run(self,r,*args,**kw):
+        return subprocess.run(['python3','workflow/bin/workflow_transition.py',*args],
+                              cwd=r,capture_output=True,text=True,**kw)
+
+    def _set_profile(self,r,**kv):
+        p=r/'PROJECT-PROFILE.md'; t=p.read_text(encoding='utf-8')
+        import re as _re
+        for k,v in kv.items():
+            k=k.replace('_',' ')
+            t=_re.sub(rf'^{_re.escape(k)}:[ \t]*.*$',f'{k}: {v}',t,count=1,flags=_re.M)
+        p.write_text(t,encoding='utf-8')
+
+    def _resolve_profile(self,r):
+        self._set_profile(r,Type='API',Web_verification_required='no',
+                          Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
+                          CI_provider='GitHub Actions',
+                          Test_database_strategy='not-applicable')
+
+    # ---- Blocker 1：receipt 只能替 probe 之前捕獲的狀態背書 -------------------
+
+    def _chained(self,r,body):
+        (r/'.myhooks').mkdir(exist_ok=True)
+        h=r/'.myhooks/pre-commit'; h.write_text(body,encoding='utf-8'); h.chmod(0o755)
+        subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','chain'],
+                       cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','config','core.hooksPath','.myhooks'],cwd=r,check=True,capture_output=True)
+        return h
+
+    def test_hook_that_rewrites_itself_during_probe_gets_no_receipt(self):
+        """probe 之後才採樣 fingerprint 的話，receipt 會替空轉版的 hook 背書。
+
+        **必須用 `mv` 換 inode。** `printf > "$0"` 會截斷 shell 正在讀的檔案，
+        `exit` 那行讀不到，hook 回 0 而被 probe 判失敗 —— 那樣測到的是自我改寫
+        腳本的 artifact，不是這條防禦。
+        """
+        td,r=self._repo()
+        try:
+            h=self._chained(r,'#!/bin/sh\n'
+                              'bash .githooks/pre-commit\n'
+                              'rc=$?\n'
+                              'printf \'%s\\n\' \'#!/bin/sh\' \'exit 0\' > "$0.new"\n'
+                              'chmod +x "$0.new"\n'
+                              'mv -f "$0.new" "$0"\n'
+                              'exit "$rc"\n')
+            x=self._run(r,'enforcement-status','--probe')
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                'hook 在 probe 期間把自己換成空轉版，不得回報成功\n'+out)
+            self.assertIn('probe 期間狀態發生變動',out,out)
+            self.assertEqual(h.read_text(encoding='utf-8').strip().splitlines()[-1],'exit 0',
+                             '前提檢查：攻擊確實生效了，hook 現在是空轉版')
+            self.assertFalse((r/'.git/starter-enforcement-probe.json').exists(),
+                             'receipt 必須被刪除；留著會讓下一次不加 --probe 的查詢'
+                             '繼續宣稱「行為驗證通過」')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_stale_receipt_is_removed_not_merely_left_unwritten(self):
+        """先有一份合法 receipt，再換成會自我改寫的 hook —— 舊 receipt 不得存活。"""
+        td,r=self._repo()
+        try:
+            self._chained(r,'#!/bin/sh\nbash .githooks/pre-commit\n')
+            ok=self._run(r,'enforcement-status','--probe')
+            self.assertEqual(ok.returncode,0,'前提：誠實的 chained hook 應該通過\n'+ok.stdout+ok.stderr)
+            receipt=r/'.git/starter-enforcement-probe.json'
+            self.assertTrue(receipt.exists(),'前提：誠實路徑會寫 receipt')
+            h=r/'.myhooks/pre-commit'
+            h.write_text('#!/bin/sh\n'
+                         'bash .githooks/pre-commit\n'
+                         'rc=$?\n'
+                         'printf \'%s\\n\' \'#!/bin/sh\' \'exit 0\' > "$0.new"\n'
+                         'chmod +x "$0.new"\n'
+                         'mv -f "$0.new" "$0"\n'
+                         'exit "$rc"\n',encoding='utf-8')
+            h.chmod(0o755)
+            x=self._run(r,'enforcement-status','--probe')
+            self.assertNotEqual(x.returncode,0,x.stdout+x.stderr)
+            self.assertFalse(receipt.exists(),'舊 receipt 必須被刪除，不能只是「這次沒寫」')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_honest_chained_hook_still_records_a_receipt(self):
+        """對照組。上面兩條若靠「一律不寫 receipt」通過，這條會紅。"""
+        td,r=self._repo()
+        try:
+            self._chained(r,'#!/bin/sh\nbash .githooks/pre-commit\n')
+            x=self._run(r,'enforcement-status','--probe')
+            self.assertEqual(x.returncode,0,x.stdout+x.stderr)
+            self.assertIn('ACTIVE_CHAINED',x.stdout,x.stdout)
+            self.assertTrue((r/'.git/starter-enforcement-probe.json').exists())
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 2：change identifier 的 canonical validation ------------------
+
+    def test_start_change_rejects_path_traversal(self):
+        """`..` 會讓路徑指向 openspec/，它非空，所以「目錄不得為空」的檢查通過。"""
+        td,r=self._repo()
+        try:
+            (r/'openspec/changes').mkdir(parents=True,exist_ok=True)
+            x=self._run(r,'start-change','..')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,31,out)
+            self.assertIn('路徑巡訪',out,out)
+            self.assertIn('Active OpenSpec change: none',(r/'workflow/STATE.md').read_text(encoding='utf-8'),
+                          'STATE 不得被污染')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_start_change_rejects_path_separator(self):
+        td,r=self._repo()
+        try:
+            d=r/'openspec/changes/real/sub'; d.mkdir(parents=True)
+            (d/'proposal.md').write_text('x',encoding='utf-8')
+            x=self._run(r,'start-change','real/sub')
+            self.assertEqual(x.returncode,31,x.stdout+x.stderr)
+            self.assertIn('路徑分隔符',x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_start_change_rejects_newline_injection(self):
+        """STATE.md 是逐行格式；換行會注入第二個 `Phase:`。"""
+        td,r=self._repo()
+        try:
+            evil='evil\nPhase: ENGINEERING'
+            d=r/'openspec/changes'/evil
+            try: d.mkdir(parents=True)
+            except OSError: d=None
+            if d is not None: (d/'proposal.md').write_text('x',encoding='utf-8')
+            x=self._run(r,'start-change',evil)
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,31,out)
+            self.assertIn('控制字元',out,out)
+            state=(r/'workflow/STATE.md').read_text(encoding='utf-8')
+            self.assertEqual(len([l for l in state.splitlines() if l.startswith('Phase:')]),1,
+                             'STATE 只能有一個 Phase 欄位\n'+state)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_legitimate_change_names_still_work(self):
+        """對照組：validator 不得順手擋掉正常名字（含大寫與點）。"""
+        td,r=self._repo()
+        try:
+            for name in ('add-auth','Add_Auth.v2','a'):
+                d=r/'openspec/changes'/name; d.mkdir(parents=True)
+                (d/'proposal.md').write_text('x',encoding='utf-8')
+                x=self._run(r,'start-change',name)
+                self.assertEqual(x.returncode,0,f'{name} 應該合法\n'+x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_polluted_state_reports_a_readable_error_not_a_traceback(self):
+        """fail-closed 不等於處理得當。Control Plane 壞掉不能長得像工具壞掉。"""
+        td,r=self._repo()
+        try:
+            p=r/'workflow/STATE.md'
+            p.write_text(p.read_text(encoding='utf-8').replace(
+                'Active OpenSpec change: none','Active OpenSpec change: ..'),encoding='utf-8')
+            x=self._run(r,'status')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,42,out)
+            self.assertNotIn('Traceback',out,'不得噴 stack trace\n'+out)
+            self.assertIn('無法解析',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_verify_sh_rejects_traversal_change_and_writes_nothing_outside(self):
+        """verify.sh 直接 grep STATE，繞過 parse_state，所以要共用同一個 validator。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='純模板 repo')
+            p=r/'workflow/STATE.md'
+            p.write_text(p.read_text(encoding='utf-8').replace(
+                'Active OpenSpec change: none','Active OpenSpec change: ..'),encoding='utf-8')
+            x=subprocess.run(['bash','workflow/bin/verify.sh','--full'],
+                             cwd=r,capture_output=True,text=True)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('不合法',out,out)
+            self.assertFalse((r/'workflow/core').exists(),
+                             'evidence 不得被寫到 workflow/ 底下（越出宣告的 ownership）')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 3：profile 的 schema、涵蓋範圍與批准綁定 ----------------------
+
+    def test_typo_in_type_is_rejected_not_treated_as_resolved(self):
+        """`WEB_AP` 原本會被當成已解析，而 Browser Gate 因此判為 NON_WEB。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r); self._set_profile(r,Type='WEB_AP')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                un,inv,res,dg=W.profile_resolution(r)
+                self.assertEqual(un,[],'不是「未填」，是「填錯」')
+                self.assertTrue(any(n=='Type' for n,_,_ in inv),f'必須列為 invalid：{inv}')
+                self.assertIsNone(dg,'有 invalid 就不得產生 digest')
+                self.assertEqual(W.project_web_status(r),'UNRESOLVED',
+                                 '決定 Gate 開關的那一層也要 fail-closed，'
+                                 '不能靠「不等於 WEB_APP」推論它是非 Web')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_testdb_strategy_enum_and_other_escape_hatch(self):
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                for good in W.TESTDB_STRATEGIES:
+                    self._set_profile(r,Test_database_strategy=good)
+                    _,inv,_,dg=W.profile_resolution(r)
+                    self.assertEqual(inv,[],f'{good} 應該合法')
+                    self.assertIsNotNone(dg)
+                self._set_profile(r,Test_database_strategy='之後再決定')
+                _,inv,_,dg=W.profile_resolution(r)
+                self.assertTrue(inv,'自由文字必須被擋 —— 它跟 UNKNOWN 一樣未決')
+                self.assertIsNone(dg)
+                self._set_profile(r,Test_database_strategy='other:')
+                _,inv,_,_=W.profile_resolution(r)
+                self.assertTrue(inv,'單獨的 `other:` 是 UNKNOWN 換皮')
+                self._set_profile(r,Test_database_strategy='other: Firestore emulator')
+                _,inv,_,dg=W.profile_resolution(r)
+                self.assertEqual(inv,[],'逃生口必須真的能用')
+                self.assertIsNotNone(dg)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_free_text_fields_stay_free_text(self):
+        """對照組：沒有正式 vocabulary 的欄位不得被順手加上約束。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            self._set_profile(r,Primary_stack='某個沒人聽過的框架',
+                              Package_manager='自製工具',CI_provider='內部系統')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                _,inv,_,dg=W.profile_resolution(r)
+                self.assertEqual(inv,[],f'自由文字欄位不該被擋：{inv}')
+                self.assertIsNotNone(dg)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_verification_waiver_changes_the_approved_digest(self):
+        """waiver 必須在人類批准的內容裡面，否則等於批准了一份看不見的政策。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                _,_,res_a,dg_a=W.profile_resolution(r)
+                self.assertIn('Core verification policy',res_a,
+                              'TTY 畫面用 resolved 產生；不在裡面就等於沒顯示')
+                self._set_profile(r,Core_verification_policy='not-applicable',
+                                  Verification_exception_reason='skip automated checks')
+                _,_,res_b,dg_b=W.profile_resolution(r)
+                self.assertNotEqual(dg_a,dg_b,'豁免 automated verification 必須改變 digest')
+                self.assertEqual(res_b['Verification exception reason'],'skip automated checks')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_start_engineering_rejects_profile_changed_after_approval(self):
+        """批准綁的是內容不是旗標。approve-spec 與 start-engineering 之間可以隔任意久。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            d=r/'openspec/changes/demo'; d.mkdir(parents=True)
+            (d/'proposal.md').write_text('x',encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                _,_,_,dg=W.profile_resolution(r)
+                W.write_state(r/'workflow/STATE.md',
+                              W.WorkflowState('TEST_DESIGN','GREENFIELD','demo','yes','yes','no',
+                                              'human',W.now_iso(),dg))
+                ok=self._run(r,'start-engineering','demo')
+                self.assertEqual(ok.returncode,0,'前提：未改動時應該通過\n'+ok.stdout+ok.stderr)
+                s=W.parse_state(r/'workflow/STATE.md')
+                W.write_state(r/'workflow/STATE.md',dataclasses_replace(s,phase='TEST_DESIGN'))
+                self._set_profile(r,Core_verification_policy='not-applicable',
+                                  Verification_exception_reason='skip')
+                x=self._run(r,'start-engineering','demo')
+                out=x.stdout+x.stderr
+                self.assertEqual(x.returncode,44,out)
+                self.assertIn('人類批准的內容不一致',out,out)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_start_engineering_fails_closed_on_state_without_digest_field(self):
+        """舊 schema 的 STATE 無法證明 profile 被批准過 —— 必須要求重新 approve-spec。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r)
+            d=r/'openspec/changes/demo'; d.mkdir(parents=True)
+            (d/'proposal.md').write_text('x',encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib, workflow_state as W
+                importlib.reload(W)
+                W.write_state(r/'workflow/STATE.md',
+                              W.WorkflowState('TEST_DESIGN','GREENFIELD','demo','yes','yes','no',
+                                              'human',W.now_iso()))
+                p=r/'workflow/STATE.md'
+                p.write_text(re.sub(r'^Approved profile digest:.*\n','',
+                                    p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+                x=self._run(r,'start-engineering','demo')
+                out=x.stdout+x.stderr
+                self.assertEqual(x.returncode,44,out)
+                self.assertIn('重新執行 approve-spec',out,out)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_approve_spec_lists_invalid_separately_from_unresolved(self):
+        """「填錯」與「沒填」給同一句話，使用者會以為自己沒存檔而重打同樣的錯字。"""
+        td,r=self._repo()
+        try:
+            self._resolve_profile(r); self._set_profile(r,Monorepo='maybe')
+            subprocess.run(['python3','workflow/bin/workflow_transition.py','set-mode','GREENFIELD'],
+                           cwd=r,check=True,capture_output=True)
+            d=r/'openspec/changes/demo'; (d/'specs').mkdir(parents=True)
+            (d/'proposal.md').write_text('x',encoding='utf-8')
+            (d/'tasks.md').write_text('x',encoding='utf-8')
+            (d/'specs/main.md').write_text('x',encoding='utf-8')
+            for c in (['start-change','demo'],['submit-for-review','demo']):
+                subprocess.run(['python3','workflow/bin/workflow_transition.py']+c,
+                               cwd=r,check=True,capture_output=True)
+            x=self._run(r,'approve-spec','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,44,out)
+            self.assertIn('無法辨識的值',out,out)
+            self.assertIn('maybe',out,'必須把實際填的值回顯出來')
+            self.assertNotIn('TTY',out,'必須在 TTY 檢查之前就拒絕')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
+    # ---- Blocker 3c：TTY 等待期間的重新綁定（必須用真 pty 才測得到） ----------
+
+    def _spec_review_repo(self):
+        """停在 SPEC_REVIEW、profile 已解析的 repo。"""
+        td,r=self._repo()
+        st=r/'workflow/STATE.md'
+        st.write_text(st.read_text(encoding='utf-8')
+                      .replace('Phase: DISCOVERY','Phase: SPEC_REVIEW')
+                      .replace('Active OpenSpec change: none','Active OpenSpec change: demo'),
+                      encoding='utf-8')
+        c=r/'openspec/changes/demo'; c.mkdir(parents=True,exist_ok=True)
+        for n in ('proposal.md','spec.md','tasks.md'): (c/n).write_text(n,encoding='utf-8')
+        self._resolve_profile(r)
+        return td,r
+
+    def _approve_on_pty(self, repo, mutate=None, timeout=25):
+        """在 pty 上執行 approve-spec。`mutate` 會在**提示出現之後、送出確認字串之前**
+        被呼叫 —— 那正是真實攻擊的視窗：人類正在讀畫面，另一個 process 換掉檔案。
+        """
+        import pty, os, select, time
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(str(repo))
+            os.execvp('python3',['python3','workflow/bin/workflow_transition.py','approve-spec','demo'])
+            os._exit(127)
+        out=b''; step=0
+        # 兩個提示：先問 change 名稱，再問 approval actor（簽名）。
+        # 只送一行會讓子行程停在第二個提示，測試因此掛住而不是失敗。
+        try:
+            deadline=time.time()+timeout
+            while time.time()<deadline:
+                rl,_,_=select.select([fd],[],[],0.5)
+                if rl:
+                    try: chunk=os.read(fd,4096)
+                    except OSError: break
+                    if not chunk: break
+                    out+=chunk
+                seen=out.decode(errors='replace')
+                if step==0 and '以確認' in seen:
+                    # mutate 必須在這裡：人類正在讀畫面，尚未完成確認。
+                    if mutate is not None: mutate()
+                    os.write(fd,b'demo\n'); step=1
+                elif step==1 and 'Approval actor' in seen:
+                    os.write(fd,b'tester\n'); step=2
+            _,status=os.waitpid(pid,0)
+            code=os.waitstatus_to_exitcode(status)
+        finally:
+            try: os.close(fd)
+            except OSError: pass
+        return code, out.decode(errors='replace')
+
+    def test_profile_edited_during_tty_wait_invalidates_the_approval(self):
+        """TTY 是人類速度的等待，視窗以分鐘計。人類批准的是畫面上那份，不是他打完字時磁碟上那份。"""
+        td,r=self._spec_review_repo()
+        try:
+            def mutate():
+                self._set_profile(r,Core_verification_policy='not-applicable',
+                                  Verification_exception_reason='skip automated checks')
+            code,out=self._approve_on_pty(r,mutate=mutate)
+            self.assertEqual(code,44,out)
+            self.assertIn('在你確認期間被修改',out,out)
+            self.assertIn('Phase: SPEC_REVIEW',(r/'workflow/STATE.md').read_text(encoding='utf-8'),
+                          '作廢的批准不得改動 STATE')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_unmodified_profile_still_approves_on_pty(self):
+        """對照組。上面那條若靠「approve-spec 一律失敗」通過，這條會紅。"""
+        td,r=self._spec_review_repo()
+        try:
+            code,out=self._approve_on_pty(r)
+            self.assertEqual(code,0,out)
+            state=(r/'workflow/STATE.md').read_text(encoding='utf-8')
+            self.assertIn('Phase: TEST_DESIGN',state,state)
+            self.assertNotIn('Approved profile digest: none',state,
+                             '批准必須把 digest 寫進 STATE，否則 start-engineering 無從回驗')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_tty_prompt_lists_the_verification_policy_being_approved(self):
+        """畫面上看不到的東西不算被批准過。"""
+        td,r=self._spec_review_repo()
+        try:
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='skip automated checks')
+            code,out=self._approve_on_pty(r)
+            self.assertEqual(code,0,out)
+            self.assertIn('Core verification policy: not-applicable',out,
+                          'verification waiver 必須列在人類看得到的確認畫面上\n'+out)
+            self.assertIn('skip automated checks',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
 

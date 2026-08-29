@@ -85,12 +85,26 @@ sys.exit(0)
   sys.path.insert(0,str(self.r/'workflow/bin'));import workflow_state as ws
   s=ws.parse_state(self.r/'workflow/STATE.md')
   from dataclasses import replace
-  ns=replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by='smoke-human',last_updated=ws.now_iso()) if kind=='spec' else replace(s,test_design_approved='yes',approved_by='smoke-human',last_updated=ws.now_iso())
+  # approve-spec 需要 TTY，所以這裡直接寫 STATE 代替。但代替必須**忠實** ——
+  # 真正的 approve-spec 會把當下的 profile digest 一併寫進 STATE，
+  # start-engineering 會回驗它。少寫這一欄等於假造出一個真實流程不會產生的狀態。
+  _,_,_,dg=ws.profile_resolution(self.r)
+  assert dg is not None,'e2e fixture 前提：進 approve-spec 之前 profile 必須完全解析'
+  ns=replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by='smoke-human',profile_digest=dg,last_updated=ws.now_iso()) if kind=='spec' else replace(s,test_design_approved='yes',approved_by='smoke-human',last_updated=ws.now_iso())
   ws.write_state(self.r/'workflow/STATE.md',ns);h=ws.state_hash_path(self.r/'workflow/STATE.md')
   with (self.r/'workflow/state-log.md').open('a') as f:f.write(f'## smoke\n- Actor: smoke-human\n- Action: approve-{kind}\n- Change: demo\n- From: X\n- To: {ns.phase}\n- Git SHA: SMOKE\n- State hash: {h}\n- Reason: smoke\n\n')
   sys.path.pop(0);sys.modules.pop('workflow_state',None)
  def prep_to_engineering(self,web=False):
-  p=self.r/'PROJECT-PROFILE.md';t=p.read_text().replace('Type: UNKNOWN','Type: WEB_APP' if web else 'Type: API').replace('Web verification required: auto','Web verification required: yes' if web else 'Web verification required: no');p.write_text(t);
+  p=self.r/'PROJECT-PROFILE.md';t=p.read_text().replace('Type: UNKNOWN','Type: WEB_APP' if web else 'Type: API').replace('Web verification required: auto','Web verification required: yes' if web else 'Web verification required: no')
+  # 其餘必填欄位也要解析。approve-spec 是收取 profile 定案的邊界，
+  # 讓 fixture 停在 UNKNOWN 等於繞過那個邊界去測後面的階段。
+  for a,b in (('Primary stack: UNKNOWN','Primary stack: Node.js'),
+              ('Package manager: UNKNOWN','Package manager: npm'),
+              ('Monorepo: UNKNOWN','Monorepo: no'),
+              ('CI provider: UNKNOWN','CI provider: GitHub Actions'),
+              ('Test database strategy: UNKNOWN','Test database strategy: not-applicable')):
+   t=t.replace(a,b)
+  p.write_text(t);
   for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.assertEqual(self.cli(*a).returncode,0);self.assertEqual(self.commit_transition(a[0]).returncode,0)
   self.approve_internal('spec');self.assertEqual(self.commit_transition('approve spec').returncode,0)
   (self.r/'workflow/test-cases/demo.md').write_text('cases')

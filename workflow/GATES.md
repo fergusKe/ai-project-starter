@@ -292,6 +292,83 @@ Control Plane audit 與 gate；hook probe 只能是補充的 required check。
 
 普通 `doctor` 不會自動執行第三方 hook —— probe 必須由人類明確觸發。
 
+### receipt 只能替 probe **之前**捕獲的狀態背書
+
+fingerprint 必須在**任何 probe 執行之前**取得（`F0`），probe 全部通過之後再量一次
+（`F1`），`F0 == F1` 才寫 receipt，而且寫進去的是 `F0`。
+
+為什麼不能在 probe 之後採樣（這是原本的作法）：**hook 是被實際執行的程式**，它可以在
+被驗證的過程中改變自己。實測重現 —— 一個 chained hook 先呼叫真 gate（於是本機 probe
+與 HEAD 快照 probe 都通過），再用 `mv` 把自己換成 `#!/bin/sh` + `exit 0`。舊流程在那
+之後才量 worktree，receipt 記下的是空轉版的 `hook_sha256`，`probe_receipt_valid` 回
+True，之後每次 `enforcement-status` 都繼續宣稱「行為驗證通過於 …」，而 gate 已經不在。
+
+同一條規則也關掉另一個競態視窗：`讀 C0 → bundle 捕獲 C0 → 來源切到 C1 → 快照驗 C0
+→ receipt 綁 C1`。只比較快照與最初讀到的 `C0` 抓不到它，因為快照本來就等於 `C0`。
+
+`F0 != F1` 時必須**刪除** receipt 並回非零，不能只是不寫 —— 留著上一次的舊 receipt
+會讓下一次不加 `--probe` 的 `enforcement-status` 繼續宣稱驗證通過。
+
+能力邊界：狀態在 probe 期間變成 B 又變回 A 時 `F0 == F1` 成立，而 probe 實際跑的是 B。
+關掉這個視窗需要 lock 或 kernel 級的變更通知，兩者都超出 Starter 的範圍。receipt 的
+宣稱因此是「**這個 fingerprint 被 probe 過，且前後未變**」，不是「probe 期間不存在
+其他狀態」。
+
+> 註：用 `printf > "$0"` 寫的自我改寫 hook **不會**重現這個問題 —— 那會截斷 shell
+> 正在讀的檔案，`exit` 那行讀不到，hook 回 0 而被 probe 判失敗。那是自我改寫腳本的
+> artifact，不是防禦。寫這類 regression 時必須用 `mv` 換 inode，否則測到的是別的東西。
+
+## Change identifier 的 canonical validation
+
+change 名字有**兩個**下游消費者，失敗模式完全不同，所以驗證必須集中在一個
+validator（`validate_change_id`）並在**寫入之前**執行：
+
+1. **路徑**：`openspec/changes/<id>`、`workflow/evidence/<id>/core`。實測
+   `start-change ..` 會讓路徑指向 `openspec/`，它非空，所以「目錄不得為空」的檢查
+   通過；`verify.sh` 則會把 machine evidence 寫到 `workflow/core/`，越出宣告的
+   ownership 位置。
+2. **檔案格式**：STATE.md 是 `Key: value` 的逐行格式。實測
+   `evil\nPhase: ENGINEERING` 會讓 STATE.md 出現第二個 `Phase:`。
+
+第 2 點的結果值得記下來：`parse_state_text` 的重複欄位檢查**擋住了升級**（fail-closed，
+方向正確），但擋下的方式是拋出未被接住的 `ValueError` —— 此後每一個 transition 都噴
+traceback，Control Plane 等於被砸爛，而那筆污染永久留在 append-only 的 state-log 裡。
+**fail-closed 不等於處理得當**：讀取端必須把「Control Plane 檔案損壞」報成可讀的錯誤
+（exit 42），不是 stack trace。
+
+驗證同時發生在寫入端（CLI，涵蓋所有接受 change 參數的子指令）與讀取端
+（`parse_state_text`，涵蓋已經在檔案裡的污染）。`verify.sh` 因為直接 grep STATE.md
+繞過了 `parse_state`，所以呼叫同一個 validator，不另寫一份會漂移的 shell 規則。
+
+不採「純小寫」的 allowlist：大小寫是命名風格不是安全性質，強制它會擋掉合法的既有
+專案。危險的是 `/`、`.`／`..`、控制字元與換行。
+
+## PROJECT-PROFILE 的三條不變式
+
+**一、打錯字不是未決，是已決定。** 只排除 placeholder、其餘一律視為已解析的設計會
+fail-open。實測 `Type: WEB_AP`（少一個字母）通過 profile resolution，而
+`project_web_status` 因為它不等於 `WEB_APP` 判為 `NON_WEB` —— **一個 typo 靜默關掉
+Browser Gate**。有正式 vocabulary 的欄位必須做列舉檢查，而且決定 Gate 開關的那一層
+（`project_web_status`）也要對無法辨識的值 fail-closed，不能靠「不等於 WEB_APP」推論
+它是非 Web。`invalid` 必須與 `unresolved` 分開回報，否則使用者會以為自己沒存檔。
+
+沒有可窮舉正確答案的欄位（`Primary stack`、`Package manager`、`CI provider`）維持自由
+文字。`Test database strategy` 保留 `other: <描述>` 逃生口，但描述不得為空 —— 單獨的
+`other:` 是 UNKNOWN 換皮。
+
+**二、被批准的內容必須包含驗證契約本身。** `Core verification policy`、
+`Custom verification command`、`Verification exception reason` 有預設值因此永遠「已
+解析」，但它們決定驗證契約。不納入 digest 與 TTY 顯示的話，
+`Core verification policy: not-applicable` 可以在 SPECIFICATION 階段寫進去，七個必填
+欄位全部通過，人類看到的畫面完全不提 verification 已被豁免，之後 zero-check 的
+`NOT_APPLICABLE` 就依這個從未被明示批准的政策通過。
+
+**三、批准綁的是內容，不是旗標。** 人類批准當下的 digest 寫進 STATE 的
+`Approved profile digest`；`approve-spec` 在 TTY 返回後重新比對（TTY 是人類速度的等待，
+視窗以分鐘計），`start-engineering` 再比對一次（approve-spec 與 start-engineering 之間
+可以隔任意長的時間與任意多的 agent 動作）。只檢查 approval flag 的設計看不到這段期間
+的放寬。舊 STATE 沒有這個欄位時視為未綁定並 fail-closed，要求重新 approve-spec。
+
 ## 測試案例文件的勾選狀態
 
 `workflow/test-cases/<change>.md` 的 `[ ]` / `[x]` 是**給人類閱讀與追蹤用的**，

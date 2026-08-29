@@ -1,4 +1,5 @@
 {
+  "disableAllHooks": false,
   "permissions": {
     "deny": [
       "Bash(rm -rf *)",

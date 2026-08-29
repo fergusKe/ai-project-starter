@@ -20,6 +20,46 @@ INSTALLATION_PHASE='DISCOVERY'
 INSTALLATION_ALLOWED_ROOTS={'AGENTS.md','CLAUDE.md','CONTEXT.md','PROJECT-PROFILE.md','README.md','SETUP.md','START-HERE.md','.gitignore'}
 INSTALLATION_ALLOWED_PREFIXES=('.claude/','.githooks/','docs/','openspec/','prompts/','templates/','workflow/')
 BROWSER_EVIDENCE_RE=re.compile(r"^workflow/evidence/[^/]+/browser\.md$")
+# Change identifier 的唯一合法形狀。這個名字會被當成 **path component** 使用
+# （`openspec/changes/<id>`、`workflow/evidence/<id>/…`），也會被寫進 STATE.md 與
+# append-only 的 state-log，所以它同時是路徑輸入與檔案格式輸入，兩邊都要守住。
+#
+# 不採「純小寫」的建議：大小寫是命名風格不是安全性質，強制它會擋掉合法的既有專案。
+# 真正危險的是 `/`、`.`／`..`、控制字元與換行 —— 這條 pattern 把它們全部排除。
+CHANGE_ID_RE=re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+
+def validate_change_id(change:str):
+    """回傳錯誤訊息；合法時回傳 None。
+
+    為什麼需要 canonical validator 而不是在 `ensure_change_exists` 裡多檢查幾下：
+    change 名字有**兩個**下游消費者，而且它們的失敗模式完全不同。
+
+    1. 路徑：`ROOT/'openspec/changes'/change`。`change='..'` 會解析到 `openspec/`，
+       它非空，所以「目錄必須有內容」的檢查會通過。`verify.sh` 也直接把它插進
+       `workflow/evidence/<change>/core`，`..` 會把 machine evidence 寫到宣告的
+       ownership 範圍之外。
+    2. 檔案格式：STATE.md 是 `Key: value` 的逐行格式。change 裡的換行會注入新的一行，
+       實測 `evil\\nPhase: ENGINEERING` 會讓 STATE.md 出現第二個 `Phase:`。
+       `parse_state_text` 的重複欄位檢查會擋下升級（fail-closed，方向正確），
+       但擋下的方式是拋出未被接住的 ValueError —— 此後每一個 transition 都會噴
+       traceback，Control Plane 等於被砸爛，而那筆污染已經永久留在 append-only log 裡。
+
+    所以檢查必須發生在**寫入之前**，而且要涵蓋所有接受 change 參數的入口，
+    不能只補 `start-change`。
+    """
+    if not isinstance(change,str) or not change:
+        return 'change 名稱不得為空'
+    if change in ('.','..'):
+        return f'change 名稱不得為 {change!r}：它是路徑巡訪，不是 change'
+    if '/' in change or '\\' in change:
+        return f'change 名稱不得包含路徑分隔符：{change!r}（必須是單一 path component）'
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in change):
+        return 'change 名稱不得包含控制字元或換行（會注入 STATE.md 與 state-log 的逐行格式）'
+    if not CHANGE_ID_RE.match(change):
+        return (f'change 名稱不合法：{change!r}\n'
+                '  允許的形狀：開頭為英數，其後為英數、`.`、`_`、`-`，長度上限 100。')
+    return None
 
 
 @dataclass(frozen=True)
@@ -563,15 +603,71 @@ def probe_head_enforcement(root:Path, hooks_dir_rel:str)->dict:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def record_probe_receipt(root:Path, hook:Path)->bool:
+def probe_fingerprint(root:Path, hook:Path):
+    """公開入口。呼叫端必須在 probe **開始之前**取得 F0，見 finalize_probe_receipt。"""
+    return _probe_fingerprint(root, hook)
+
+
+def invalidate_probe_receipt(root:Path)->None:
+    """移除 receipt。狀態在 probe 期間變動時必須呼叫 —— 留著舊 receipt 會讓下一次
+    `enforcement-status`（不加 --probe）繼續宣稱「行為驗證通過」。"""
+    p = probe_receipt_path(root)
+    if p is None: return
+    try: p.unlink()
+    except OSError: pass
+
+
+def record_probe_receipt(root:Path, hook:Path, fingerprint=None)->bool:
     p = probe_receipt_path(root)
     if p is None: return False
-    data = _probe_fingerprint(root, hook); data['recorded_at'] = now_iso()
+    data = dict(fingerprint) if fingerprint is not None else _probe_fingerprint(root, hook)
+    data['recorded_at'] = now_iso()
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         return True
     except OSError:
         return False
+
+
+def finalize_probe_receipt(root:Path, hook:Path, before:dict):
+    """在 probe 全部通過之後寫 receipt，但**只替 `before` 這個狀態背書**。
+
+    回傳 (ok, reason)。
+
+    為什麼不能在 probe 之後重新採樣 fingerprint（原本的作法）：hook 是被實際執行的
+    程式，它可以在被 probe 的過程中改變自己或改變 gate 實作。實測重現 —— 一個
+    chained hook 先呼叫真 gate（於是兩層 probe 都通過），再用 `mv` 把自己換成
+    `#!/bin/sh` + `exit 0`。舊流程在那之後才量 worktree，於是 receipt 記下的是空轉版
+    的 hook_sha256，`probe_receipt_valid` 回 True，之後每次 doctor 都繼續宣稱
+    「行為驗證通過於 …」，而 gate 已經不存在。
+
+    （用 `printf > "$0"` 寫的版本不會重現：那會截斷 shell 正在讀的檔案，`exit` 那行
+    讀不到，hook 回 0 而被 probe 判失敗。這是自我改寫腳本的 artifact，不是防禦。）
+
+    所以不變式是：**receipt 綁定的必須是 probe 之前捕獲、而且整段 probe 期間沒有變過
+    的狀態**。不需要 lock。
+
+    能力邊界：若狀態在 probe 期間變成 B 又變回 A，F0 == F1 會成立，而 probe 實際跑的
+    是 B。要關掉這個視窗需要 lock 或 kernel 級的變更通知，兩者都超出 Starter 的範圍。
+    receipt 的宣稱因此是「這個 fingerprint 被 probe 過，且前後未變」，不是
+    「probe 期間不存在其他狀態」。
+    """
+    after = _probe_fingerprint(root, hook)
+    if after != before:
+        invalidate_probe_receipt(root)
+        changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+        return False, ('probe 期間狀態發生變動，不能為它背書（變動欄位：'
+                       + ', '.join(changed) + '）\n'
+                       '  被驗證的狀態與現在磁碟上的狀態不同 —— hook 可能在執行過程中\n'
+                       '  改寫了自己或 gate 實作。receipt 已作廢，請釐清原因後重跑。')
+    if not record_probe_receipt(root, hook, fingerprint=before):
+        return False, '行為驗證通過，但無法寫入 probe receipt'
+    ok, why = probe_receipt_valid(root, hook)
+    if not ok:
+        # 寫完立刻以現況回驗。寫入本身也有時間，這一步把「寫入期間又變了」關掉。
+        invalidate_probe_receipt(root)
+        return False, f'receipt 寫入後立即回驗失敗：{why}'
+    return True, ''
 
 
 def probe_receipt_valid(root:Path, hook:Path):
@@ -842,6 +938,9 @@ def control_plane_digest(root:Path,changes:list[GitChange],source:str='staged')-
 @dataclass
 class WorkflowState:
     phase:str; project_mode:str; active_change:str; spec_approved:str; test_design_approved:str; verification_passed:str; approved_by:str; last_updated:str
+    # 人類在 approve-spec 當下實際看到並批准的那份 profile 的 digest。
+    # 預設 'none' 表示尚未批准，或這份 STATE 早於本欄位存在 —— 兩者都必須 fail-closed。
+    profile_digest:str='none'
     @property
     def implementation_allowed(self):
         return self.phase=="ENGINEERING" and self.spec_approved=="yes" and self.test_design_approved=="yes"
@@ -856,7 +955,17 @@ def parse_state_text(text:str)->WorkflowState:
     if values["Project mode"] not in VALID_PROJECT_MODES: raise ValueError(f"非法 Project mode: {values['Project mode']}")
     for k in ("Spec approved","Test design approved","Verification passed"):
         if values[k] not in YESNO: raise ValueError(f"{k} 必須是 yes/no")
-    return WorkflowState(values["Phase"],values["Project mode"],values["Active OpenSpec change"],values["Spec approved"],values["Test design approved"],values["Verification passed"],values["Approved by"],values["Last updated"])
+    # 讀取端也要驗。CLI 的驗證擋住新的污染，這一條擋住**已經在檔案裡**的污染 ——
+    # 例如舊版寫入的 `..`，或有人繞過工具直接編輯。value 是 'none' 表示沒有綁定 change。
+    if values["Active OpenSpec change"] != "none":
+        err=validate_change_id(values["Active OpenSpec change"])
+        if err: raise ValueError(f"STATE 的 Active OpenSpec change 不合法：{err}")
+    # 刻意讀成可選：這個欄位是後加的。舊的 STATE.md 缺少它時要能被解析並回報
+    # 'none'，由 start-engineering fail-closed 要求重新批准 —— 而不是讓工具在
+    # 讀取階段就整個掛掉，把「schema 舊了」變成「Control Plane 壞了」。
+    dg=re.findall(r"^Approved profile digest:[ \t]*(.*?)[ \t]*$",text,re.M)
+    if len(dg)>1: raise ValueError("STATE 欄位重複: Approved profile digest")
+    return WorkflowState(values["Phase"],values["Project mode"],values["Active OpenSpec change"],values["Spec approved"],values["Test design approved"],values["Verification passed"],values["Approved by"],values["Last updated"],dg[0] if dg else 'none')
 
 def parse_state(path:Path)->WorkflowState:
     if not path.exists(): raise ValueError("workflow/STATE.md 不存在")
@@ -869,7 +978,7 @@ def render_state(s:WorkflowState)->str:
         "> `Implementation allowed` 為推導值，不儲存在 STATE：僅當 Phase=ENGINEERING 且 Spec/Test Design 均 approved 時為 true。\n\n"
         f"Phase: {s.phase}\nProject mode: {s.project_mode}\nActive OpenSpec change: {s.active_change}\n"
         f"Spec approved: {s.spec_approved}\nTest design approved: {s.test_design_approved}\nVerification passed: {s.verification_passed}\n"
-        f"Approved by: {s.approved_by}\nLast updated: {s.last_updated}\n"
+        f"Approved by: {s.approved_by}\nApproved profile digest: {s.profile_digest}\nLast updated: {s.last_updated}\n"
     )
 
 def write_state(path:Path,s:WorkflowState):
@@ -912,35 +1021,98 @@ def _profile_field(root:Path, name:str):
 # 安全政策或工程行為」；純展示欄位不列入。
 # 值的意義分三層，這是本設計的核心：未知／候選／已批准。UNKNOWN 可以進 review，
 # 不能進 engineering；候選由 AI 在 ADR 提出，定案由 approve-spec 授權。
+PROFILE_TYPES = ('WEB_APP','API','CLI','LIBRARY','MOBILE','OTHER')
+PROFILE_WEB_REQUIRED = ('auto','yes','no')
+PROFILE_MONOREPO = ('yes','no')
+# 目標本身可被檢查的測試資料庫隔離策略。保留 `other: <描述>` 逃生口 —— Starter 不
+# 可能列舉所有資料庫的隔離手法，強迫從清單裡選會逼人選錯，那比自由文字更糟。
+# 但 `other:` 後面必須有非空描述：單獨一個 `other:` 是 UNKNOWN 換皮。
+TESTDB_STRATEGIES = ('not-applicable','separate-database','transaction-rollback',
+                     'ephemeral-container','schema-per-worker')
+
+# 進 ENGINEERING 之前必須解析完成的 profile 欄位。判準是「會影響 Gate、驗證契約、
+# 安全政策或工程行為」；純展示欄位不列入。
+# 值的意義分三層，這是本設計的核心：未知／候選／已批准。UNKNOWN 可以進 review，
+# 不能進 engineering；候選由 AI 在 ADR 提出，定案由 approve-spec 授權。
+#
+# 第三個元素是 allowed vocabulary（None 表示自由文字）。**沒有 vocabulary 檢查的
+# 欄位會 fail-open**：實測 `Type: WEB_AP`（少一個字母）會被當成已解析，而
+# project_web_status 因為它不等於 WEB_APP 判為 NON_WEB —— 一個 typo 就靜默關掉
+# Browser Gate。`Primary stack` / `Package manager` / `CI provider` 沒有正式
+# vocabulary，維持自由文字。
 PROFILE_REQUIRED_FOR_ENGINEERING = (
-    ('Type', ('UNKNOWN',)),
-    ('Web verification required', ('auto',)),      # auto 在此欄位是「未決」，非最終值
-    ('Primary stack', ('UNKNOWN',)),
-    ('Package manager', ('UNKNOWN',)),
-    ('Monorepo', ('UNKNOWN',)),
-    ('CI provider', ('UNKNOWN',)),
-    ('Test database strategy', ('UNKNOWN',)),
+    ('Type', ('UNKNOWN',), PROFILE_TYPES),
+    ('Web verification required', ('auto',), PROFILE_WEB_REQUIRED),  # auto 在此欄位是「未決」
+    ('Primary stack', ('UNKNOWN',), None),
+    ('Package manager', ('UNKNOWN',), None),
+    ('Monorepo', ('UNKNOWN',), PROFILE_MONOREPO),
+    ('CI provider', ('UNKNOWN',), None),
+    ('Test database strategy', ('UNKNOWN',), TESTDB_STRATEGIES),
+)
+
+# 有預設值、因此永遠「已解析」，但**會決定驗證契約**的欄位。它們不進 unresolved
+# （`auto` 是合法的最終值，不是未決），但必須進 digest 也必須顯示在 TTY 上。
+#
+# 為什麼：`Core verification policy: not-applicable` + `Verification exception
+# reason: skip automated checks` 可以在 SPECIFICATION 階段寫進去，七個必填欄位
+# 全部通過，TTY 畫面宣稱列出「即將定案的 PROJECT-PROFILE」卻完全不提這件事，
+# digest 也不涵蓋它。人類於是批准了一份看不到 verification waiver 的 profile，
+# 之後 zero-check 的 NOT_APPLICABLE 就依這個從未被明示批准的政策通過。
+PROFILE_POLICY_FIELDS = (
+    ('Core verification policy', 'auto', tuple(sorted(VERIFICATION_POLICIES))),
+    ('Custom verification command', 'none', None),
+    ('Verification exception reason', 'none', None),
 )
 
 
+def _profile_value_error(name, value, allowed):
+    """回傳該值不合法的理由，合法時回傳 None。"""
+    if allowed is None:
+        return None
+    if name == 'Test database strategy' and value.startswith('other:'):
+        return None if value[len('other:'):].strip() else (
+            '`other:` 後面必須有非空描述；單獨的 `other:` 等於未決')
+    if value in allowed:
+        return None
+    extra = '，或 `other: <描述>`' if name == 'Test database strategy' else ''
+    return f'不是可辨識的值。允許：{"、".join(allowed)}{extra}'
+
+
 def profile_resolution(root:Path):
-    """回傳 (unresolved, resolved, digest)。
+    """回傳 (unresolved, invalid, resolved, digest)。
 
     為什麼不是「UNKNOWN → 具體值可由 machine-verified transition 完成」：那個方向對
     stack 不是單調收緊 —— Next.js / Rails / Django 之間沒有嚴格順序，而
     `Test database strategy: UNKNOWN → NOT_APPLICABLE` 其實是放寬。machine 只能證明
     格式與來源，不能授權「選擇」。因此定案必須由人類在 approve-spec 授權。
+
+    `invalid` 必須跟 `unresolved` 分開回報：「你填了一個無法辨識的值」跟「你還沒填」
+    是兩件不同的事，用同一句話會讓人以為自己沒存檔。
     """
-    unresolved, resolved = [], {}
+    unresolved, invalid, resolved = [], [], {}
     h = hashlib.sha256()
-    for name, undecided in PROFILE_REQUIRED_FOR_ENGINEERING:
+    for name, undecided, allowed in PROFILE_REQUIRED_FOR_ENGINEERING:
         v = _profile_field(root, name)
         if v is None or not v or v in undecided:
-            unresolved.append(name)
-        else:
-            resolved[name] = v
-            h.update(name.encode()+b'\0'+v.encode()+b'\0')
-    return unresolved, resolved, (h.hexdigest() if not unresolved else None)
+            unresolved.append(name); continue
+        why = _profile_value_error(name, v, allowed)
+        if why:
+            invalid.append((name, v, why)); continue
+        resolved[name] = v
+    for name, default, allowed in PROFILE_POLICY_FIELDS:
+        v = _profile_field(root, name)
+        if v is None or not v: v = default
+        why = _profile_value_error(name, v, allowed)
+        if why:
+            invalid.append((name, v, why)); continue
+        resolved[name] = v
+    # digest 只在完全沒有問題時產生。有 invalid 卻仍給 digest 等於把一個爛值
+    # 記進「已批准」的稽核紀錄。
+    if unresolved or invalid:
+        return unresolved, invalid, resolved, None
+    for name in sorted(resolved):
+        h.update(name.encode()+b'\0'+resolved[name].encode()+b'\0')
+    return unresolved, invalid, resolved, h.hexdigest()
 
 
 PROVENANCE_INFO='INFO'
@@ -1177,6 +1349,11 @@ def project_web_status(root:Path)->str:
         m=re.search(rf"^{re.escape(name)}:[ \t]*(.*?)[ \t]*$",text,re.M); return m.group(1).strip() if m else None
     typ,req=field('Type'),field('Web verification required')
     if typ is None or req is None:return 'UNRESOLVED'
+    # 無法辨識的 Type 一律 fail-closed。這是決定 Browser Gate 開關的那一層，
+    # 不能因為值「不等於 WEB_APP」就推論它是非 Web —— `WEB_AP` 也不等於 WEB_APP。
+    # 'UNKNOWN' 保持原語意（明確的未決），不併入這條。
+    if typ not in PROFILE_TYPES and typ!='UNKNOWN':return 'UNRESOLVED'
+    if req not in PROFILE_WEB_REQUIRED:return 'UNRESOLVED'
     if req=='yes':return 'WEB'
     if req=='no':return 'WEB' if typ=='WEB_APP' else 'NON_WEB'
     if req!='auto':return 'UNRESOLVED'

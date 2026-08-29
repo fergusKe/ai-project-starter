@@ -92,6 +92,16 @@ fi
 if [[ "$MODE" == "--full" ]];then
  change="$(grep '^Active OpenSpec change:' workflow/STATE.md | sed 's/^Active OpenSpec change:[[:space:]]*//')"
  [[ -n "$change" && "$change" != "none" ]] || { echo "ERROR: full verification 需要 Active OpenSpec change" >&2;exit 32; }
+ # 這裡直接 grep STATE.md，繞過了 parse_state 的驗證，所以必須自己驗一次。
+ # 下面會把 $change 插進 evidence 路徑：`..` 會讓 machine evidence 寫到
+ # workflow/ 底下，越出宣告的 ownership 位置。共用同一個 canonical validator，
+ # 不要在 shell 裡另寫一份會漂移的規則。
+ if ! python3 -c 'import sys;sys.path.insert(0,"workflow/bin")
+from workflow_state import validate_change_id
+err=validate_change_id(sys.argv[1])
+sys.exit(0) if err is None else (sys.stderr.write("ERROR: STATE 的 Active OpenSpec change 不合法："+err+"\n"),sys.exit(1))' "$change"; then
+  exit 32
+ fi
  outcome="PASS"
  if [[ "$policy" == "not-applicable" ]]; then outcome="NOT_APPLICABLE"; fi
  if [[ $failed -ne 0 ]]; then outcome="FAIL"; fi

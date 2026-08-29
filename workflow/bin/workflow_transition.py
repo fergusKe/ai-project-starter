@@ -7,8 +7,9 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  staged_changes,control_plane_digest,change_touches_control_plane,initial_state_hash,
  installation_conflicts,installation_overwrites,installation_preflight,installation_unexpected_changes,staged_state_is_pristine,
  repository_enforcement,enforcement_is_active,GATE_BRIDGE_COMMAND,verification_policy,
- probe_enforcement,probe_head_enforcement,record_probe_receipt,effective_pre_commit_hook,
- ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance)
+ probe_enforcement,probe_head_enforcement,effective_pre_commit_hook,
+ probe_fingerprint,finalize_probe_receipt,
+ ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance,validate_change_id)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
 def die(msg,code):sys.stdout.flush();print(f'ERROR: {msg}',file=sys.stderr);raise SystemExit(code)
@@ -232,16 +233,31 @@ def cmd_approve_spec(a):
  # PROJECT-PROFILE 的定案在這個邊界收取。在 TTY 之前檢查，理由有二：
  # 一是 fail fast，不要讓人類打完確認字串才被拒；二是這條規則因此在沒有 TTY 的
  # 環境下也測得到。
- unresolved,resolved,digest=profile_resolution(ROOT)
+ unresolved,invalid,resolved,digest=profile_resolution(ROOT)
  if unresolved:
   die('approve-spec 之前必須先解析 PROJECT-PROFILE.md 的下列欄位：\n'
       +''.join(f'  - {x}\n' for x in unresolved)
       +'UNKNOWN（或 Web verification required: auto）可以進 SPEC_REVIEW，但不能進 ENGINEERING。\n'
       '候選值請先寫成 ADR 與 OpenSpec 的一部分，由本次批准一併定案；'
       '不要在沒有依據時猜測。',44)
- details='即將定案的 PROJECT-PROFILE：\n'+''.join(f'  {k}: {v}\n' for k,v in resolved.items())
+ if invalid:
+  # 與 unresolved 分開報。「填了無法辨識的值」跟「還沒填」是兩件事，
+  # 混在一起會讓人以為自己沒存檔而重打一次同樣的錯字。
+  die('PROJECT-PROFILE.md 有無法辨識的值：\n'
+      +''.join(f'  - {n}: {v!r} —— {why}\n' for n,v,why in invalid)
+      +'打錯字不會被當成未決，會被當成已決定 —— 而錯的值可能靜默關掉某個 Gate。',44)
+ details='即將定案的 PROJECT-PROFILE：\n'+''.join(f'  {k}: {resolved[k]}\n' for k in sorted(resolved))
  actor=tty_human_confirm('approve-spec',a.change,details)
- transition(s,replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by=actor,last_updated=now_iso()),'approve-spec',actor,f'Human approved specification; profile digest {digest[:16]}')
+ # TTY 是人類速度的等待，視窗以分鐘計。回來之後必須重新比對：人類批准的是畫面上
+ # 那份 profile，不是「他打完字時磁碟上剛好是什麼」。沒有這一步，另一個 process
+ # 可以在等待期間換掉 PROJECT-PROFILE，而 log 仍記著畫面上那份的 digest。
+ _,_,_,after=profile_resolution(ROOT)
+ if after!=digest:
+  die('PROJECT-PROFILE.md 在你確認期間被修改，批准作廢。\n'
+      '  你看到並批准的是修改前的內容；請重新檢視後再執行一次 approve-spec。',44)
+ transition(s,replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by=actor,
+                      profile_digest=digest,last_updated=now_iso()),
+            'approve-spec',actor,f'Human approved specification; profile digest {digest[:16]}')
 def cmd_approve_tests(a):
  s=parse_state(STATE)
  if s.phase!='TEST_DESIGN':die('approve-tests 只允許 TEST_DESIGN',42)
@@ -253,7 +269,20 @@ def cmd_start_engineering(a):
  if s.phase!='TEST_DESIGN':die('start-engineering 只允許 TEST_DESIGN',44)
  if s.spec_approved!='yes' or s.test_design_approved!='yes':die('Spec/Test Design 尚未批准',45)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
- transition(s,replace(s,phase='ENGINEERING',last_updated=now_iso()),'start-engineering','machine-verified','Approval prerequisites satisfied')
+ # 只看 approval flag 不夠。approve-spec 與 start-engineering 之間可以隔任意長的
+ # 時間與任意多的 agent 動作；把 `Core verification policy` 改成 not-applicable
+ # 這種放寬，在只檢查 flag 的設計下不會被任何人發現。批准綁的是**內容**，不是旗標。
+ if s.profile_digest=='none':
+  die('STATE 沒有記錄批准時的 PROJECT-PROFILE digest。\n'
+      '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的 profile\n'
+      '  就是人類批准過的那一份。請重新執行 approve-spec。',44)
+ unresolved,invalid,_,current=profile_resolution(ROOT)
+ if unresolved or invalid or current!=s.profile_digest:
+  die('PROJECT-PROFILE.md 與 approve-spec 當下人類批准的內容不一致，不得進入 ENGINEERING。\n'
+      f'  批准時 digest: {s.profile_digest[:16]}\n'
+      f'  目前 digest:   {(current or "（無法計算：欄位未解析或有非法值）")[:16]}\n'
+      '  profile 定案之後要改，必須回 SPECIFICATION 修訂 ADR/OpenSpec 並重新 review。',44)
+ transition(s,replace(s,phase='ENGINEERING',last_updated=now_iso()),'start-engineering','machine-verified','Approval prerequisites satisfied; profile digest re-verified')
 def cmd_verification_pass(a):
  s=parse_state(STATE)
  if s.phase not in {'ENGINEERING','VERIFICATION'}:die('verification-pass 只允許 ENGINEERING/VERIFICATION',46)
@@ -409,6 +438,9 @@ def cmd_enforcement_status(args):
  if getattr(args,'probe',False):
   hook=effective_pre_commit_hook(ROOT)
   if hook is None or not hook.is_file():die('找不到有效的 pre-commit hook；無法進行行為驗證',5)
+  # F0 必須在**任何 probe 執行之前**捕獲。hook 是會被實際執行的程式，probe 之後
+  # 才採樣等於讓被驗證的對象決定 receipt 的內容。見 finalize_probe_receipt。
+  before=probe_fingerprint(ROOT,hook)
   print(f'正在對 {hook} 執行行為驗證（使用暫時 index，不動真實 index/worktree）…')
   r=probe_enforcement(ROOT)
   if not r['ok']:
@@ -430,7 +462,8 @@ def cmd_enforcement_status(args):
    die(f"HEAD 快照行為驗證失敗：{h['reason']}\n"
        '本機 hook 有效，但 clone 之後不生效 —— Repository enforcement 不成立。',5)
   print('✓ HEAD 快照行為驗證通過：clone 之後 gate 仍然生效')
-  if not record_probe_receipt(ROOT,hook):die('行為驗證通過，但無法寫入 probe receipt',5)
+  ok,why=finalize_probe_receipt(ROOT,hook,before)
+  if not ok:die(why,5)
  info=_print_enforcement()
  if not enforcement_is_active(info):raise SystemExit(4)
 
@@ -508,5 +541,19 @@ def main():
  p=sp.add_parser('enforcement-status');p.add_argument('--probe',action='store_true',
   help='實際執行有效 hook 並確認它會攔下 Control Plane mutation；通過後才能標為 ACTIVE_CHAINED');p.set_defaults(fn=cmd_enforcement_status)
  p=sp.add_parser('adopt-control-plane');p.add_argument('--dry-run',action='store_true');p.set_defaults(fn=cmd_adopt_control_plane)
- a=ap.parse_args();a.fn(a)
+ a=ap.parse_args()
+ # 單一驗證點，涵蓋**所有**接受 change 參數的子指令。刻意不做成 argparse 的 type=：
+ # 那條路徑會以 exit 2 結束，跟 Starter 其他 gate 的專屬 exit code 混在一起，
+ # 呼叫端分不出「參數打錯」與「gate 拒絕」。
+ change=getattr(a,'change',None)
+ if change is not None:
+  err=validate_change_id(change)
+  if err:die(err,31)
+ try:
+  a.fn(a)
+ except ValueError as exc:
+  # STATE.md 內容不合法（含歷史上被污染的檔案）必須是可讀的錯誤，不是 traceback。
+  # 之前這裡會直接噴 stack trace，讓「Control Plane 壞掉」看起來像「工具壞掉」。
+  die(f'workflow/STATE.md 無法解析：{exc}\n'
+      '  Control Plane 檔案已損壞或被污染，請由人類檢視 git 歷史後修復。',42)
 if __name__=='__main__':main()
