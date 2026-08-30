@@ -39,8 +39,34 @@ Self tests 使用 isolated pristine fixture，不依賴宿主專案目前的 STA
 Agent / 人類 / 一般 script 不得直接使用 `git commit --no-verify` 或 `git commit -n`。
 唯一合法例外是 `workflow_transition.py control-plane-commit` 與首次 Brownfield 的 `adopt-control-plane`；兩者都必須經 TTY Human Authorization、限制 staged scope，並同步寫入 audit log。
 
+**上面這一段是規範，不是機制。** `--no-verify` 是 git 自己提供的旗標，Starter
+攔不到它 —— pre-commit 沒被執行，就沒有任何本機程式碼有機會表示意見。一個有
+shell 權限的 agent 只要打這個旗標，本機所有 gate 同時失效。
+
+而「對有 shell 權限的對手，規範不構成約束」正是這整套 Control Plane 存在的前提。
+把它套用在自己身上：**本機層永遠只能做到「盡量」，真正的 gate 必須在伺服器端。**
+
+因此 `--no-verify` 的完整答案是兩段：本機寫成規範（讓誠實的參與者知道界線），
+伺服器端寫成機制（讓不誠實的參與者過不去）。後者的設定與驗證步驟見
+`workflow/MERGE-PROTECTION.md`，**包含一個必做的失敗實測** —— 沒有實際看過
+「合併按鈕變灰」，就不能宣稱這一層存在。
+
+沒有 remote 的單機專案不適用第二段。那種情境下 `--no-verify` 是已知的、無法
+消除的邊界，應在 `CONTEXT.md` 明白記錄，不要假裝本機 gate 是完整的。
+
 ## Team Authorization
-團隊專案建議依 `templates/CODEOWNERS.example` 建立真正的 `.github/CODEOWNERS`，並搭配 branch protection / required review。不要保留範例中的 `@YOUR_TEAM`。
+團隊專案必須依 `templates/CODEOWNERS.example` 建立真正的 `.github/CODEOWNERS`，並搭配 branch protection / required review。不要保留範例中的 `@YOUR_TEAM`。
+
+CODEOWNERS 的涵蓋範圍不只 Control Plane 本體，還必須包含：
+
+- `.github/`（**執法層自己**。CI workflow 與 CODEOWNERS 若可被自由修改，
+  required check 與 required review 都能被安靜地拆掉。守衛的設定檔必須跟守衛
+  一樣受保護。）
+- `PROJECT-PROFILE.md`、`openspec/`、`workflow/test-cases/`（**被批准的內容**。
+  它們的 digest 被寫進 STATE 並由 gate 複驗，改它們等於改已批准的範圍。）
+- `workflow/evidence/`（**封存證據**。review 是本機 freeze 之外的第二道。）
+
+完整設定流程見 `workflow/MERGE-PROTECTION.md`。
 
 ## Git mutation model
 Gate 以 `status + old_path + new_path` 判定 staged mutation，不只檢查檔案寫入。Control Plane 的 create / modify / delete / rename-away / rename-into 都受保護；`workflow/STATE.md` 與 `workflow/state-log.md` 不得刪除或改名。

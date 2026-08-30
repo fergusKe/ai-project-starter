@@ -67,4 +67,14 @@ Starter 不直接 ship `.github/workflows/`，因為 Brownfield 專案可能已�
 
 範本使用版本化的 `actions/checkout@vN` 並設定 `fetch-depth: 0`，因為 `audit-control-plane.py` 需要完整 Git 歷史。範本中的 checkout major version 最後人工核對日期為 2026-08-29；外部 Action 版本需在重大 Starter 釋出前重新確認。PR 中以 `git merge-base origin/$GITHUB_BASE_REF HEAD` 作 base。
 
-建議把 `control-plane-audit` 設成 branch protection 的 required check。首次 Greenfield root commit 若沒有 parent，手動驗證時可用 Git empty-tree hash 作 base。Brownfield 不需要特別找安裝 commit 的前一筆；audit 會辨識 sanctioned installation baseline。
+首次 Greenfield root commit 若沒有 parent，手動驗證時可用 Git empty-tree hash 作 base。Brownfield 不需要特別找安裝 commit 的前一筆；audit 會辨識 sanctioned installation baseline。
+
+## CI 建好之後還沒完
+
+CI 會跑，不等於 CI 擋得住。一條紅燈但仍可合併的 CI，只是一個比較慢的 lint。
+
+`control-plane-audit` 與專案自己的測試 job **必須**被設成 branch protection 的
+required check，而且要實際做一次失敗實測（故意讓測試紅，確認合併按鈕變灰）。
+
+設定步驟、驗證動作與已知邊界見 `workflow/MERGE-PROTECTION.md`。這是 Starter
+本機 gate 之外唯一擋得住 `git commit --no-verify` 的一層，不是選配。

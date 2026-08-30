@@ -84,8 +84,14 @@ TEST_DESIGN 可寫 `workflow/test-cases/**`。先建立 requirement→test trace
 ## Web Verification
 Web policy 必須明確；UNKNOWN/auto 未決 fail-closed。WEB_APP 無法用 `no` 關閉 Browser Gate。06 可反覆驗證並寫 browser.md；07 只消費 evidence。操作細節見 `workflow/BROWSER-VERIFICATION.md`。
 
+非 Web 專案（`Web verification required: no`）標記 NOT APPLICABLE 只代表「不需要瀏覽器」，不代表「不需要真的跑一次」。API 專案的端點驗證（正確／錯誤／權限三類情境）見 `workflow/DEPLOYMENT.md`。
+
 ## Git / CI
 Transition CLI 不自動 commit；每次 transition 後先獨立提交 STATE+state-log。不得靜默覆蓋既有 Husky/Lefthook/pre-commit/core.hooksPath；依 `workflow/CI.md` 建立實際 CI。
 
+本機 pre-commit 擋不住 `git commit --no-verify`；伺服器端的 required status check 才是真正的 gate。設定與失敗實測見 `workflow/MERGE-PROTECTION.md`。
+
 ## 完成
 只有 approved spec/test design、implementation、lint/typecheck/tests/build、Web Gate（適用時）、machine core evidence、browser evidence 與 OpenSpec compliance 全部通過才能 archive。散文式「已完成」不算 evidence。
+
+ARCHIVE 是 Control Plane 的終點，不是產品的終點。打包、上線與上線後的安全／效能課題見 `workflow/DEPLOYMENT.md`（準則層，不受 gate 管轄）。

@@ -32,3 +32,11 @@ Chrome 後開啟 `context.newCDPSession()`，啟用 `Runtime` / `Log` / `Network
 
 `doctor` 會在 `Web status: WEB` 時回報 Playwright 與 Chrome DevTools MCP 的可用性；
 請在進入 ENGINEERING 之前先確認，不要做到最後一關才發現工具不通。
+
+## 非 Web 專案
+
+`Web verification required: no` 的專案不啟用 Browser Gate，`browser.md` 標記
+NOT APPLICABLE。這只表示不需要瀏覽器，**不表示不需要真的把服務跑起來打一次**。
+
+本文件的核心主張（自動測試通過但實際流程失敗，視為未完成）對 API 專案一樣成立，
+只是工具不同。端點驗證應涵蓋正確／錯誤／權限三類情境，做法見 `workflow/DEPLOYMENT.md`。

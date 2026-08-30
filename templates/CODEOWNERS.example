@@ -1,7 +1,28 @@
 # Replace @YOUR_TEAM with a real GitHub user/team before enabling.
+# 留著 @YOUR_TEAM 等於沒設定。
+#
+# 搭配 branch protection 的 "Require review from Code Owners" 才會生效，
+# 設定步驟見 workflow/MERGE-PROTECTION.md。
+
+# --- Control Plane 本體 ---
 /workflow/bin/ @YOUR_TEAM
 /.claude/ @YOUR_TEAM
 /.githooks/ @YOUR_TEAM
 /workflow/STATE.md @YOUR_TEAM
 /workflow/state-log.md @YOUR_TEAM
 /workflow/GATES.md @YOUR_TEAM
+
+# --- 執法層本身 ---
+# CI workflow 與 CODEOWNERS 若可被自由修改，required check 與 review 都能被拆掉。
+# 守衛的設定檔必須跟守衛一樣受保護。
+/.github/ @YOUR_TEAM
+
+# --- 被批准的內容 ---
+# 這些檔案的 digest 被寫進 STATE 並由 gate 複驗；改它們等於改「已批准的範圍」。
+/PROJECT-PROFILE.md @YOUR_TEAM
+/openspec/ @YOUR_TEAM
+/workflow/test-cases/ @YOUR_TEAM
+
+# --- 封存證據 ---
+# ARCHIVE 之後不得修改；review 是本機 freeze 之外的第二道。
+/workflow/evidence/ @YOUR_TEAM
