@@ -4,31 +4,34 @@ import argparse,re,subprocess,sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
 from workflow_state import (audit_commit_changes,change_touches_control_plane,control_plane_digest,
  parse_state_text,installation_baseline,installation_unexpected_changes,AUDIT_FAIL_CLOSED_PHASE,
- path_is_ai_writable_non_product,evidence_write_allowed,implementation_authorized_at,
+ path_is_ai_writable_non_product,evidence_write_allowed,implementation_authorized_at,is_evidence_path,
  path_is_installation_scaffolding,
- state_hash_text,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE)
+ state_hash_text)
 STATE_PATH='workflow/STATE.md';LOG_PATH='workflow/state-log.md'
 
 def g(*a,text=True):return subprocess.run(['git','-C',str(ROOT),*a],capture_output=True,text=text)
 
 def appended_log_declares_install(commit):
- """本 commit **自己新追加**的那一段 state-log 是否宣告安裝。
+ """本 commit 新追加的 log 是否宣告一次**形狀完整**的安裝。
 
  不能用 `log_has_action` 在累積 log 裡找：state-log 是 append-only，Brownfield
- 只要曾經安裝過一次 Starter，之後**每一個** commit 的 log 都仍含那筆 action，
- 豁免因此永久生效。實測重現 —— 安裝之後在 DISCOVERY 新增 `templates/rogue.sh`
- （`templates/` 屬安裝範圍），未經任何批准仍被放行。
+ 只要曾經安裝過一次，之後每一個 commit 的 log 都仍含那筆 action，豁免因此永久生效。
+ 實測重現 —— 安裝後在 DISCOVERY 新增 `templates/rogue.sh`，零批准仍被放行。
 
- 豁免必須同時綁定事件、時間與路徑，只滿足其中一項不夠。
+ 也不能只找到一行 action 就算：同一個 commit 裡人工追加一行假的 install action
+ 一樣能打開豁免。必須是一個具備必要欄位的完整 block。
+
+ 豁免必須同時綁定**事件、時間與路徑**，只滿足其中一項不夠。
  """
- parent=parent_of(commit)
- after=log_bytes(commit) or b''
- before=(log_bytes(parent) or b'') if parent else b''
- if not after.startswith(before):return False   # 連續性違規；此處 fail-closed
- appended=after[len(before):]
- try:txt=appended.decode('utf-8')
- except UnicodeDecodeError:return False
- return re.search(r'(?m)^- Action:\s*install-adopt-control-plane\s*$',txt) is not None
+ txt=appended_log_text(commit)
+ if txt is None:return False
+ for block in re.split(r'(?m)^## ',txt)[1:]:
+  if not re.search(r'(?m)^- Action:\s*install-adopt-control-plane\s*$',block):continue
+  # 完整形狀：append_log 一定會寫出這幾欄。缺任何一欄代表這不是流程產生的紀錄。
+  if all(re.search(rf'(?m)^- {k}:\s*\S',block)
+         for k in ('Actor','Change','From','To','Git SHA','State hash','Reason')):
+   return True
+ return False
 
 def state_at(commit):
  """該 commit 的完整 STATE。取不到或壞掉回 None。"""
@@ -97,7 +100,7 @@ def workflow_authorization_violations(commit,changes,state,installing=False):
   desc=f'{ch.status}: '+(' -> '.join(ch.paths) if ch.status=='R' else ch.paths[0])
   is_product=False
   for pp in ch.paths:
-   if CORE_EVIDENCE_RE.match(pp) or BROWSER_EVIDENCE_RE.match(pp):
+   if is_evidence_path(pp):
     if not evidence_write_allowed(pp,state):evidence.append(desc)
     continue
    if path_is_ai_writable_non_product(pp,state.phase):continue
@@ -138,18 +141,25 @@ def parent_of(commit):
  parts=r.stdout.strip().split() if r.returncode==0 else []
  return parts[1] if len(parts)>1 else None
 
-def log_has_action(commit,action):
- raw=log_bytes(commit)
- if raw is None:return False
- try:txt=raw.decode('utf-8')
- except UnicodeDecodeError:return False
- return re.search(rf'(?m)^- Action:\s*{re.escape(action)}\s*$',txt) is not None
+def appended_log_text(commit):
+ """本 commit **自己新追加**的那一段 state-log。取不到或不連續回 None。
+
+ state-log 是 append-only，所以「歷史上曾經出現過」與「這一次真的發生了」是兩件事。
+ 兩個地方都吃過這個虧：安裝豁免（找得到就永久生效），以及下面的 audit record ——
+ 舊 record 的 digest 可以被重用（把檔案改回從前某個授權過的內容 B，
+ mutation path、status 與 bytes 都一樣，digest 因此相同，audit 在歷史裡找到舊 record
+ 就放行，而這次的變更從未被任何人授權）。
+ """
+ parent=parent_of(commit)
+ after=log_bytes(commit) or b''
+ before=(log_bytes(parent) or b'') if parent else b''
+ if not after.startswith(before):return None   # 連續性違規；fail-closed
+ try:return after[len(before):].decode('utf-8')
+ except UnicodeDecodeError:return None
 
 def audit_record_matches(commit,digest):
- raw=log_bytes(commit)
- if raw is None:return False
- try:txt=raw.decode('utf-8')
- except UnicodeDecodeError:return False
+ txt=appended_log_text(commit)
+ if txt is None:return False
  for block in re.split(r'(?m)^## ',txt)[1:]:
   if re.search(r'(?m)^- Action:\s*(?:control-plane-commit|install-adopt-control-plane)\s*$',block) and re.search(rf'(?m)^- Control Plane digest:\s*{re.escape(digest)}\s*$',block):
    return True

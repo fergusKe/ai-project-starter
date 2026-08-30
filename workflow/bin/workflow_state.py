@@ -1035,6 +1035,18 @@ def path_is_control_plane(rel:str,phase:str)->bool:
     if rel in CONTROL_PLANE_FILES or any(rel.startswith(p) for p in CONTROL_PLANE_PREFIXES): return True
     return rel in EARLY_MUTABLE_POLICY_FILES and phase not in {'DISCOVERY','SPECIFICATION'}
 
+def is_evidence_path(rel:str)->bool:
+    """任何一種 evidence 檔案。**消費端一律用這個，不要各自列舉。**
+
+    各自列舉的地方一定會漏掉新加的那一種 —— `api.md` 就是這樣漏的：
+    `API_EVIDENCE_RE` 加進了 `evidence_write_allowed`，但 check-implementation-gate
+    與 audit-control-plane 仍只認 core/browser，於是已封存的 API evidence
+    可以事後被一般 commit 自由改寫，本機與伺服器端都不會有意見。
+    """
+    return bool(CORE_EVIDENCE_RE.match(rel) or BROWSER_EVIDENCE_RE.match(rel)
+                or API_EVIDENCE_RE.match(rel))
+
+
 def api_verification_required(root:Path, source:str='worktree')->bool:
     """`Type: API` 的專案要求端點驗證 evidence。
 
@@ -1062,8 +1074,7 @@ def evidence_write_allowed(rel:str, state)->bool:
     階段（ENGINEERING / VERIFICATION），才能寫自己的 evidence。其餘一律凍結 ——
     包含歷史 change 的、以及尚未進入工程階段的本輪 change 的。
     """
-    if not (CORE_EVIDENCE_RE.match(rel) or BROWSER_EVIDENCE_RE.match(rel)
-            or API_EVIDENCE_RE.match(rel)): return False
+    if not is_evidence_path(rel): return False
     m = EVIDENCE_CHANGE_RE.match(rel)
     if not m: return False
     if m.group(1) != getattr(state,'active_change','none'): return False
@@ -1072,7 +1083,9 @@ def evidence_write_allowed(rel:str, state)->bool:
 
 def path_is_ai_writable_non_product(rel:str,phase:str)->bool:
     if rel in AI_WRITABLE_ROOT or any(rel.startswith(p) for p in AI_WRITABLE_PREFIXES): return True
-    if BROWSER_EVIDENCE_RE.match(rel) or API_EVIDENCE_RE.match(rel): return True
+    # **evidence 不在這裡豁免。** 它有自己的所有權判準（evidence_write_allowed）：
+    # 只有目前 active change 在 ENGINEERING/VERIFICATION 才能寫自己的那一份。
+    # 原本在這裡無條件回 True，等於讓所有權判準在 product loop 被整個繞過。
     if rel=='PROJECT-PROFILE.md' and phase in {'DISCOVERY','SPECIFICATION'}: return True
     return False
 

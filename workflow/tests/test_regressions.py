@@ -4610,6 +4610,193 @@ class RC5Round18ApiVerificationTests(unittest.TestCase):
         finally: shutil.rmtree(td,ignore_errors=True)
 
 
+class RC5Round19Tests(unittest.TestCase):
+    """Codex 第十八輪。三個 blocker 全部是我加 API 驗證時製造的，加上一個同源的舊病。
+
+    共同主題：**新增一種東西時，所有消費端都要一起更新** —— 各自列舉的地方
+    一定會漏掉新的那一種。
+    """
+
+    def _repo(self, typ='API'):
+        td=Path(tempfile.mkdtemp(prefix='rc5r19-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        pp=r/'PROJECT-PROFILE.md'; s=pp.read_text(encoding='utf-8')
+        pp.write_text(s.replace('Type: UNKNOWN',f'Type: {typ}')
+                      .replace('Web verification required: auto','Web verification required: no')
+                      .replace('## Critical user journeys\n- 尚未定義',
+                               '## Critical user journeys\n- [J1] 端點 A'),encoding='utf-8')
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _gate(self,r):
+        return subprocess.run(['python3','workflow/bin/check-implementation-gate.py','--staged'],
+                              cwd=r,capture_output=True,text=True)
+
+    def _set_state(self,r,phase,change):
+        st=r/'workflow/STATE.md'; s=st.read_text(encoding='utf-8')
+        s=re.sub(r'^Phase:.*$',f'Phase: {phase}',s,flags=re.M)
+        s=re.sub(r'^Active OpenSpec change:.*$',f'Active OpenSpec change: {change}',s,flags=re.M)
+        st.write_text(s,encoding='utf-8')
+
+    # ---- Blocker 1：api.md 沒接上所有權凍結 --------------------------------
+
+    def test_archived_api_evidence_is_frozen(self):
+        """`API_EVIDENCE_RE` 加進了 evidence_write_allowed，但 check-implementation-gate
+        與 audit-control-plane 仍只認 core/browser，而 path_is_ai_writable_non_product
+        又把 api.md 無條件豁免 —— 三個地方各自列舉，於是已封存的 API evidence
+        可以被一般 commit 自由改寫。判準因此收斂成 `is_evidence_path()`。
+        """
+        td,r=self._repo()
+        try:
+            ev=r/'workflow/evidence/old-change'; ev.mkdir(parents=True)
+            (ev/'api.md').write_text('J1: success=PASS validation=PASS authorization=PASS\n',
+                                     encoding='utf-8')
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','commit','--no-verify','-m','base'],cwd=r,check=True,capture_output=True)
+            # 新一輪已在 ENGINEERING，去改上一輪的 api.md
+            self._set_state(r,'ENGINEERING','current-change')
+            (ev/'api.md').write_text('J1: success=FAIL validation=FAIL authorization=FAIL\n',
+                                     encoding='utf-8')
+            subprocess.run(['git','add','workflow/evidence'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,'已封存的 API evidence 必須凍結\n'+out)
+            self.assertIn('不屬於目前工作範圍',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_is_evidence_path_covers_every_kind(self):
+        """隔離判準本身。新增第四種 evidence 時，這條會逼你回來更新它。"""
+        sys.path.insert(0,str(SRC/'workflow/bin'))
+        try:
+            import workflow_state as W; importlib.reload(W)
+            for rel in ('workflow/evidence/x/core/20260101T000000Z.md',
+                        'workflow/evidence/x/browser.md',
+                        'workflow/evidence/x/api.md'):
+                self.assertTrue(W.is_evidence_path(rel),rel)
+            self.assertFalse(W.is_evidence_path('workflow/evidence/x/notes.md'))
+            self.assertFalse(W.is_evidence_path('src/app.py'))
+            # 也不得在 path_is_ai_writable_non_product 被無條件豁免
+            for rel in ('workflow/evidence/x/browser.md','workflow/evidence/x/api.md'):
+                self.assertFalse(W.path_is_ai_writable_non_product(rel,'ENGINEERING'),
+                                 f'{rel} 必須走所有權判準，不得無條件豁免')
+        finally: sys.path.remove(str(SRC/'workflow/bin'))
+
+    # ---- Blocker 3：not-applicable 只給 authorization ------------------------
+
+    def test_success_and_validation_cannot_be_not_applicable(self):
+        """逃生口是給「確實沒有權限概念的端點」，不是讓 success/validation 也免驗。
+        三類全填 not-applicable 原本可以在零 PASS 的情況下 archive。"""
+        td,r=self._repo()
+        try:
+            self._set_state(r,'ENGINEERING','demo')
+            ev=r/'workflow/evidence/demo'; ev.mkdir(parents=True)
+            (ev/'api.md').write_text(
+                'J1: success=not-applicable validation=not-applicable authorization=not-applicable\n',
+                encoding='utf-8')
+            import contextlib, io
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W, workflow_transition as T
+                importlib.reload(W); importlib.reload(T)
+                err=io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    T.validate_api('demo')
+                self.assertEqual(cm.exception.code,58,err.getvalue())
+                self.assertIn('success=not-applicable',err.getvalue(),err.getvalue())
+                self.assertIn('只有 authorization',err.getvalue(),err.getvalue())
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- 附帶：audit record 的時間綁定 ---------------------------------------
+
+    def test_audit_record_cannot_be_reused_from_history(self):
+        """**與安裝豁免同源，我上一輪只修了一半。**
+
+        `audit_record_matches` 原本搜整份累積 log，所以舊 record 的 digest 可被重用：
+        把檔案改回從前某個授權過的內容 B，mutation path / status / resulting bytes
+        都相同，digest 因此相同，audit 在歷史裡找到那筆舊 record 就放行 ——
+        而這一次的變更從未被任何人授權。
+        """
+        td,r=self._repo()
+        try:
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','commit','--no-verify','-m','baseline'],cwd=r,check=True,capture_output=True)
+            base=subprocess.run(['git','rev-parse','HEAD'],cwd=r,capture_output=True,text=True).stdout.strip()
+            target=r/'workflow/bin/check-workflow.sh'
+            original=target.read_text(encoding='utf-8')
+
+            def authorized(content,msg):
+                """比照 control-plane-commit：先 stage，算出 digest，再連同 log 一起提交。"""
+                target.write_text(content,encoding='utf-8')
+                subprocess.run(['git','add','--','workflow/bin/check-workflow.sh'],cwd=r,check=True,capture_output=True)
+                sys.path.insert(0,str(r/'workflow/bin'))
+                try:
+                    import workflow_state as W; importlib.reload(W)
+                    cp=[c for c in W.staged_changes(r) if W.change_touches_control_plane(c,'DISCOVERY')]
+                    dg=W.control_plane_digest(r,cp,'staged')
+                finally: sys.path.remove(str(r/'workflow/bin'))
+                lg=r/'workflow/state-log.md'
+                lg.write_text(lg.read_text(encoding='utf-8')+
+                              f'## {msg}\n- Actor: human\n- Action: control-plane-commit\n'
+                              f'- Change: none\n- From: DISCOVERY\n- To: DISCOVERY\n'
+                              f'- Git SHA: X\n- State hash: '+('0'*64)+'\n'
+                              f'- Control Plane digest: {dg}\n- Reason: {msg}\n\n',encoding='utf-8')
+                subprocess.run(['git','add','--','workflow/state-log.md'],cwd=r,check=True,capture_output=True)
+                subprocess.run(['git','commit','--no-verify','-m',msg],cwd=r,check=True,capture_output=True)
+                return dg
+
+            b_content=original+'\n# variant B\n'
+            dg_b=authorized(b_content,'授權變更為 B')
+            authorized(original+'\n# variant C\n','授權變更為 C')
+            # 前兩筆是合法的
+            ok=subprocess.run(['python3','workflow/bin/audit-control-plane.py',base,'HEAD'],
+                              cwd=r,capture_output=True,text=True)
+            self.assertEqual(ok.returncode,0,'前提：兩筆授權變更必須通過\n'+ok.stdout+ok.stderr)
+            # 未授權地改回 B —— digest 與歷史上那筆 record 相同，但沒有新的 record
+            target.write_text(b_content,encoding='utf-8')
+            subprocess.run(['git','add','--','workflow/bin/check-workflow.sh'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','commit','--no-verify','-m','未授權地改回 B'],cwd=r,check=True,capture_output=True)
+            x=subprocess.run(['python3','workflow/bin/audit-control-plane.py','HEAD^','HEAD'],
+                             cwd=r,capture_output=True,text=True)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                f'舊 record（digest {dg_b[:12]}）不得被重用\n'+out)
+            self.assertIn('沒有對應的 audit record',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- 我自己撞到的：guard hook 崩掉等於放行 --------------------------------
+
+    def test_guard_hook_fails_closed_on_unexpected_error(self):
+        """**守衛壞掉必須是拒絕，不是沉默。**
+
+        PreToolUse hook 非零退出（非 exit 2）不會阻擋工具呼叫 —— guard 崩掉等於放行。
+        實際踩到過：改 import 時漏掉一個名稱，NameError 讓整支程式沒有輸出，
+        而所有寫入都被視為允許。
+        """
+        td,r=self._repo()
+        try:
+            h=r/'.claude/hooks/guard-workflow-gate.py'
+            h.write_text(h.read_text(encoding='utf-8').replace(
+                "    raw=(payload.get('tool_input') or {}).get('file_path')",
+                "    raise RuntimeError('模擬崩潰')\n"
+                "    raw=(payload.get('tool_input') or {}).get('file_path')"),encoding='utf-8')
+            x=subprocess.run(['python3','.claude/hooks/guard-workflow-gate.py'],cwd=r,
+                             input='{"tool_input":{"file_path":"x"}}',capture_output=True,text=True)
+            self.assertIn('deny',x.stdout,'guard 崩潰時必須拒絕\n'+x.stdout+x.stderr)
+            self.assertIn('fail-closed',x.stdout,x.stdout)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
 # 必須放在檔案最末端。放在 class 定義之前會讓「直接執行本檔」只跑到當下已定義的少數測試，
 # 卻仍印出 OK —— 那是比沒有測試更危險的假信心。
 if __name__ == "__main__":

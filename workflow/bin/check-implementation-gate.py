@@ -4,7 +4,7 @@ import re,subprocess,sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
 from workflow_state import (
     parse_state,path_is_control_plane,path_is_ai_writable_non_product,
-    state_hash_text,initial_state_hash,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,evidence_write_allowed,
+    state_hash_text,initial_state_hash,is_evidence_path,evidence_write_allowed,
     staged_changes,change_touches_control_plane,installation_baseline,installation_unexpected_changes,
     implementation_authorized,
 )
@@ -80,7 +80,7 @@ if control:
 frozen=[]
 for c in changes:
     for pth in c.paths:
-        if not (CORE_EVIDENCE_RE.match(pth) or BROWSER_EVIDENCE_RE.match(pth)):continue
+        if not is_evidence_path(pth):continue
         if evidence_write_allowed(pth,s):continue
         frozen.append(f'{c.status}: '+(' -> '.join(c.paths) if c.status=='R' else pth))
         break

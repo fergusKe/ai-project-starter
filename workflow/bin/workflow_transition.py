@@ -104,7 +104,10 @@ def _accepted_evidence_from_log(change):
   path=re.search(r'(?m)^- Core evidence:[ \t]*(.*?)[ \t]*$',block)
   digest=re.search(r'(?m)^- Core evidence sha256:[ \t]*([0-9a-f]{64})[ \t]*$',block)
   bdigest=re.search(r'(?m)^- Browser evidence sha256:[ \t]*([0-9a-f]{64})[ \t]*$',block)
-  if path and digest:return path.group(1),digest.group(1),(bdigest.group(1) if bdigest else None)
+  adigest=re.search(r'(?m)^- API evidence sha256:[ \t]*([0-9a-f]{64})[ \t]*$',block)
+  if path and digest:return (path.group(1),digest.group(1),
+                             (bdigest.group(1) if bdigest else None),
+                             (adigest.group(1) if adigest else None))
   return None
  return None
 
@@ -248,7 +251,13 @@ def validate_api(change):
    m=re.search(rf'\b{cat}=(\S+)',body)
    if not m:bad.append(f'{jid}：缺少 {cat}=');continue
    v=m.group(1).lower()
-   if v not in ('pass','not-applicable'):bad.append(f'{jid}：{cat}={m.group(1)}')
+   # **逃生口只給 authorization。** 它是給「確實沒有權限概念的端點」用的，
+   # 不是讓 success 與 validation 也免驗 —— 否則三類全填 not-applicable
+   # 就能在零 PASS 的情況下 archive，這個 gate 等於不存在。
+   allowed=('pass','not-applicable') if cat=='authorization' else ('pass',)
+   if v not in allowed:
+    hint='' if cat=='authorization' else '（只有 authorization 可以是 not-applicable）'
+    bad.append(f'{jid}：{cat}={m.group(1)}{hint}')
  if missing:
   die('API evidence 沒有涵蓋下列已批准的 critical journey：\n  - '+'\n  - '.join(missing),58)
  if dup:
@@ -513,9 +522,17 @@ def cmd_verification_pass(a):
  # 不證明「這份就是 verification-pass 當時驗收的那一份」。
  bf=browser_file(a.change); bdigest=_sha256(bf)
  if bdigest is None:die('無法計算 browser evidence digest',54)
- append_log('verification-pass','machine-verified',s.phase,'VERIFICATION',a.change,'Core/browser evidence validated',
-            extra={'Core evidence':rel,'Core evidence sha256':digest,
-                   'Browser evidence sha256':bdigest})
+ extra={'Core evidence':rel,'Core evidence sha256':digest,'Browser evidence sha256':bdigest}
+ # api.md 與 browser.md 是同一類：AI-writable，卻是 archive 的前提之一。
+ # 只靠 archive 重跑 validate_api 不夠 —— 那只證明「現在這份也合法」，
+ # 不證明「這份就是 verification-pass 當時驗收的那一份」。
+ # 這是第十四輪 browser evidence 已經修過的同一類 provenance bug。
+ if api_verification_required(ROOT):
+  adigest=_sha256(api_file(a.change))
+  if adigest is None:die('無法計算 API evidence digest',54)
+  extra['API evidence sha256']=adigest
+ append_log('verification-pass','machine-verified',s.phase,'VERIFICATION',a.change,'Core/browser/API evidence validated',
+            extra=extra)
  print('Transition complete: verification-pass')
  print(f'Accepted core evidence: {rel}')
  print('NEXT REQUIRED ACTION: 先獨立提交 workflow/STATE.md 與 workflow/state-log.md，再進行下一階段工作。')
@@ -527,7 +544,7 @@ def cmd_archive(a):
  if not ok:die(f'archive 需要已批准的內容仍然一致。\n{why}',44)
  accepted=_accepted_evidence_from_log(a.change)
  if accepted is None:die('state-log 找不到 verification-pass 所接受的 core evidence 記錄；請重跑 verification-pass',51)
- rel,expected,expected_browser=accepted
+ rel,expected,expected_browser,expected_api=accepted
  canonical=f'workflow/evidence/{a.change}/core/'
  if not rel.startswith(canonical) or '..' in rel:
   die(f'state-log 記錄的 evidence 路徑不在 canonical 位置（{canonical}）：{rel}',51)
@@ -552,16 +569,34 @@ def cmd_archive(a):
       f'  驗收時 sha256: {expected_browser[:16]}\n'
       f'  目前 sha256:   {(got_browser or "（無法計算）")[:16]}\n'
       '  browser.md 是 AI-writable，因此必須釘住；請重跑 verification-pass。',51)
+ if api_verification_required(ROOT):
+  if expected_api is None:
+   die('state-log 的 verification-pass 記錄沒有 API evidence sha256；'
+       '該記錄早於本欄位存在，請重跑 verification-pass',51)
+  got_api=_sha256(api_file(a.change))
+  if got_api!=expected_api:
+   die('API evidence 與 verification-pass 當時驗收的那一份不符。\n'
+       f'  驗收時 sha256: {expected_api[:16]}\n'
+       f'  目前 sha256:   {(got_api or "（無法計算）")[:16]}\n'
+       '  api.md 是 AI-writable，因此必須釘住；請重跑 verification-pass。',51)
  transition(s,replace(s,phase='ARCHIVE',last_updated=now_iso()),'archive','machine-verified','Evidence complete')
 def cmd_revert(a):
  s=parse_state(STATE)
  if s.phase=='ARCHIVE':die('已 ARCHIVE 的 change 不可 revert；請建立新的 OpenSpec change',58)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
- bf=browser_file(a.change)
- if bf.exists():
-  stale=bf.with_name('browser.'+now_iso().replace(':','').replace('+','_')+'.stale.md')
-  bf.replace(stale);print(f'Browser evidence marked stale: {stale.name}')
- transition(s,replace(s,phase='SPECIFICATION',spec_approved='no',test_design_approved='no',verification_passed='no',approved_by='none',last_updated=now_iso()),'revert-to-spec','ai-or-human',a.reason or 'Spec gap discovered')
+ stamp=now_iso().replace(':','').replace('+','_')
+ # **兩種 evidence 都要 stale。** 只處理 browser.md 的話，journey ID 不變而描述／語意
+ # 改掉時，舊的 API evidence 會被下一次 verification 原封不動地重用。
+ for f,label in ((browser_file(a.change),'Browser'),(api_file(a.change),'API')):
+  if f.exists():
+   stale=f.with_name(f.stem+'.'+stamp+'.stale.md')
+   f.replace(stale);print(f'{label} evidence marked stale: {stale.name}')
+ # 三個 digest 也要清。留著 stale digest 雖然不授權任何能力（重新批准會覆寫），
+ # 但會讓 STATE 的語意不乾淨 —— 旗標說「未批准」而 digest 說「批准過某份內容」。
+ transition(s,replace(s,phase='SPECIFICATION',spec_approved='no',test_design_approved='no',
+                      verification_passed='no',approved_by='none',profile_digest='none',
+                      spec_digest='none',test_design_digest='none',last_updated=now_iso()),
+            'revert-to-spec','ai-or-human',a.reason or 'Spec gap discovered')
 
 def cmd_control_plane_commit(args):
  s=parse_state(STATE)
