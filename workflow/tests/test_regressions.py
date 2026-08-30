@@ -4189,6 +4189,123 @@ class RC5Round16Tests(unittest.TestCase):
         finally: shutil.rmtree(td,ignore_errors=True)
 
 
+class RC5Round17ServerAuditTests(unittest.TestCase):
+    """伺服器端 required check 必須真的檢查工作流授權。
+
+    背景：`MERGE-PROTECTION.md` 宣稱 CI required check 擋得住 `--no-verify`，
+    但出貨的 workflow 只跑 `audit-control-plane.py`，而那支程式原本對
+    `implementation_authorized` / `approved_content_status` / phase 全部零引用。
+    **一份批評「規範不是機制」的文件，自己寫下了沒有機制支撐的宣稱。**
+    """
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5r17-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','commit','--no-verify','-m','baseline'],cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _commit(self,r,*paths,msg='x'):
+        subprocess.run(['git','add','--',*paths],cwd=r,capture_output=True)
+        subprocess.run(['git','commit','--no-verify','-m',msg],cwd=r,capture_output=True)
+
+    def _audit(self,r,base='HEAD^',head='HEAD'):
+        return subprocess.run(['python3','workflow/bin/audit-control-plane.py',base,head],
+                              cwd=r,capture_output=True,text=True)
+
+    def test_unauthorized_product_code_is_rejected(self):
+        """**核心重現。** DISCOVERY 階段、零批准、`--no-verify` 推上去的產品程式碼，
+        原本會拿到 `Control Plane audit: OK` —— 因為 audit 只找 Control Plane
+        mutation，找不到就通過。GitHub ruleset 只保證指定的 check 必須成功，
+        它不會替 check 補上沒有實作的政策。"""
+        td,r=self._repo()
+        try:
+            (r/'src').mkdir()
+            (r/'src/payment.py').write_text('def transfer_all_funds(): pass\n',encoding='utf-8')
+            self._commit(r,'src/payment.py',msg='產品程式碼')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,'未授權的產品變更必須被 required check 擋下\n'+out)
+            self.assertIn('未授權的產品變更',out,out)
+            self.assertIn('Phase=DISCOVERY',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_state_only_mutation_without_log_is_rejected(self):
+        """audit 原本有意排除只涉及 STATE/state-log 的變更，因此連它自己較窄的宣稱
+        （Control Plane mutation 與 audit record 一致）都沒完全做到。"""
+        td,r=self._repo()
+        try:
+            st=r/'workflow/STATE.md'
+            st.write_text(re.sub(r'^Last updated:.*$','Last updated: 2099-01-01T00:00:00Z',
+                                 st.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            self._commit(r,'workflow/STATE.md',msg='只動 STATE')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('state-log',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_ai_writable_paths_still_pass(self):
+        """對照組。稽核不得把正常的 DISCOVERY 工作（寫 openspec、docs、prompts）
+        也擋掉 —— 那會讓使用者第一天就學會不跑這個 check。"""
+        td,r=self._repo()
+        try:
+            d=r/'openspec/changes/demo'; d.mkdir(parents=True)
+            (d/'proposal.md').write_text('# P\n',encoding='utf-8')
+            (r/'docs/note.md').write_text('# note\n',encoding='utf-8')
+            self._commit(r,'openspec','docs',msg='discovery 產出')
+            x=self._audit(r)
+            self.assertEqual(x.returncode,0,'AI-writable 路徑必須放行\n'+x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_evidence_of_other_change_is_rejected(self):
+        """evidence 所有權判準必須同時存在於本機與伺服器。只有本機有的話，
+        `--no-verify` 就是一條完整的繞道。"""
+        td,r=self._repo()
+        try:
+            st=r/'workflow/STATE.md'
+            s=st.read_text(encoding='utf-8')
+            s=re.sub(r'^Phase:.*$','Phase: ENGINEERING',s,flags=re.M)
+            s=re.sub(r'^Active OpenSpec change:.*$','Active OpenSpec change: current',s,flags=re.M)
+            st.write_text(s,encoding='utf-8')
+            ev=r/'workflow/evidence/old-change/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# tampered\n',encoding='utf-8')
+            self._commit(r,'workflow/STATE.md','workflow/evidence',msg='改別的 change 的 evidence')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('evidence 不在可寫範圍內',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_merge_protection_doc_is_control_plane(self):
+        """**能改規則的人等於能改結果。**
+
+        `MERGE-PROTECTION.md` 定義伺服器端執法、`github-workflow-control-plane-audit.yml`
+        就是那個 required check 本身。兩者若可被一般 commit 改掉，整層執法可以被
+        安靜地拆除，而稽核不會有任何意見。GATES.md / CI.md 本來就在保護清單裡，
+        這是同一條判準。
+        """
+        sys.path.insert(0,str(SRC/'workflow/bin'))
+        try:
+            import workflow_state as W
+            importlib.reload(W)
+            for rel in ('workflow/MERGE-PROTECTION.md','workflow/DEPLOYMENT.md',
+                        'templates/github-workflow-control-plane-audit.yml'):
+                self.assertTrue(W.path_is_control_plane(rel,'ENGINEERING'),
+                                f'{rel} 必須受 Control Plane 保護')
+        finally: sys.path.remove(str(SRC/'workflow/bin'))
+
+
 # 必須放在檔案最末端。放在 class 定義之前會讓「直接執行本檔」只跑到當下已定義的少數測試，
 # 卻仍印出 OK —— 那是比沒有測試更危險的假信心。
 if __name__ == "__main__":
