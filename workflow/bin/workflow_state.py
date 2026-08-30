@@ -10,7 +10,10 @@ VALID_PHASES=["DISCOVERY","SPECIFICATION","SPEC_REVIEW","TEST_DESIGN","ENGINEERI
 VALID_PROJECT_MODES={"UNSET","GREENFIELD","BROWNFIELD"}
 YESNO={"yes","no"}
 CONTROL_PLANE_PREFIXES=("workflow/bin/","workflow/tests/",".claude/hooks/",".githooks/")
-CONTROL_PLANE_FILES={".claude/settings.json","workflow/STATE.md","workflow/state-log.md","workflow/GATES.md","workflow/CI.md","workflow/BROWSER-VERIFICATION.md","workflow/SHIPPED-MANIFEST.txt","templates/CODEOWNERS.example","templates/test-db-safety.md"}
+# Starter 的**政策文件**與執法層設定屬於 Control Plane：能改規則的人等於能改結果。
+# MERGE-PROTECTION.md 定義伺服器端執法、github-workflow-control-plane-audit.yml
+# 就是那個 required check 本身 —— 兩者若可被一般 commit 改掉，整層執法可以被安靜地拆除。
+CONTROL_PLANE_FILES={".claude/settings.json","workflow/STATE.md","workflow/state-log.md","workflow/GATES.md","workflow/CI.md","workflow/BROWSER-VERIFICATION.md","workflow/MERGE-PROTECTION.md","workflow/DEPLOYMENT.md","workflow/SHIPPED-MANIFEST.txt","templates/CODEOWNERS.example","templates/test-db-safety.md","templates/github-workflow-control-plane-audit.yml"}
 EARLY_MUTABLE_POLICY_FILES={"PROJECT-PROFILE.md"}
 AI_WRITABLE_PREFIXES=("docs/","openspec/","prompts/",".claude/skills/","workflow/test-cases/")
 AI_WRITABLE_ROOT={"AGENTS.md","CLAUDE.md","CONTEXT.md","README.md","START-HERE.md","SETUP.md",".gitignore"}
@@ -1007,6 +1010,16 @@ def initial_state_hash():
     s=WorkflowState('DISCOVERY','UNSET','none','no','no','no','none','none')
     return state_hash_text(render_state(s))
 
+def path_is_installation_scaffolding(rel:str)->bool:
+    """該路徑是否屬於「安裝 Starter 本身」會帶進來的檔案。
+
+    安裝 commit 加入的是**工具**，不是產品功能，因此不受實作授權管轄 ——
+    否則 Starter 的安裝動作會被 Starter 自己的稽核判成「DISCOVERY 階段的未授權實作」。
+    這個豁免只在 commit 帶有合法的安裝 audit record 時才適用。
+    """
+    return rel in INSTALLATION_ALLOWED_ROOTS or rel.startswith(INSTALLATION_ALLOWED_PREFIXES)
+
+
 def path_is_control_plane(rel:str,phase:str)->bool:
     if rel in CONTROL_PLANE_FILES or any(rel.startswith(p) for p in CONTROL_PLANE_PREFIXES): return True
     return rel in EARLY_MUTABLE_POLICY_FILES and phase not in {'DISCOVERY','SPECIFICATION'}
@@ -1046,12 +1059,26 @@ CHECK_RUNNABLE = 'runnable'
 CHECK_UNAVAILABLE = 'unavailable'
 
 
-def _profile_field(root:Path, name:str):
-    p = root/'PROJECT-PROFILE.md'
-    if not p.exists():
-        return None
-    m = re.search(rf"^{re.escape(name)}:[ \t]*(.*?)[ \t]*$", p.read_text(encoding='utf-8'), re.M)
+def profile_text(root:Path, source:str='worktree'):
+    """PROJECT-PROFILE.md 的內容；取不到或非 UTF-8 回 None。
+
+    存在的理由：CI 稽核必須對**某個 commit 的樹**判斷「當時的 profile 是什麼」，
+    不能只看開發者磁碟上現在是什麼。所有 profile 判準因此都拆成
+    `*_in(text)` 的純函式加上一層讀檔 wrapper。"""
+    raw = _read_from(root, source, 'PROJECT-PROFILE.md')
+    if raw is None: return None
+    try: return raw.decode('utf-8')
+    except UnicodeDecodeError: return None
+
+
+def _field_in(text, name:str):
+    if text is None: return None
+    m = re.search(rf"^{re.escape(name)}:[ \t]*(.*?)[ \t]*$", text, re.M)
     return m.group(1).strip() if m else None
+
+
+def _profile_field(root:Path, name:str):
+    return _field_in(profile_text(root), name)
 
 
 # 進 ENGINEERING 之前必須解析完成的 profile 欄位。判準是「會影響 Gate、驗證契約、
@@ -1126,25 +1153,29 @@ def profile_resolution(root:Path):
     `invalid` 必須跟 `unresolved` 分開回報：「你填了一個無法辨識的值」跟「你還沒填」
     是兩件不同的事，用同一句話會讓人以為自己沒存檔。
     """
+    return profile_resolution_in(profile_text(root))
+
+
+def profile_resolution_in(text):
     unresolved, invalid, resolved = [], [], {}
     h = hashlib.sha256()
     for name, undecided, allowed in PROFILE_REQUIRED_FOR_ENGINEERING:
-        v = _profile_field(root, name)
+        v = _field_in(text, name)
         if v is None or not v or v in undecided:
             unresolved.append(name); continue
         why = _profile_value_error(name, v, allowed)
         if why:
             invalid.append((name, v, why)); continue
         resolved[name] = v
-    journeys, journey_errors = journeys_status(root)
+    journeys, journey_errors = journeys_status_in(text)
     # 格式錯誤對**所有**專案都要報。非 WEB 專案不必填 journeys，但既然填了，
     # 一個寫壞的項目仍然代表使用者以為自己寫了某件事而系統沒收到。
     invalid.extend(journey_errors)
-    if project_web_status(root)=='WEB' and not journeys:
+    if project_web_status_in(text)=='WEB' and not journeys:
         # 只對 WEB 專案要求。API/CLI 沒有 journey 可言，強制它們填等於製造假資料。
         unresolved.append('Critical user journeys（WEB 專案必須以 `- [J1] 描述` 的形式列出）')
     for name, default, allowed in PROFILE_POLICY_FIELDS:
-        v = _profile_field(root, name)
+        v = _field_in(text, name)
         if v is None or not v: v = default
         why = _profile_value_error(name, v, allowed)
         if why:
@@ -1160,7 +1191,7 @@ def profile_resolution(root:Path):
     # 內容。不納入 digest 的話：批准含「結帳、付款」的 profile 之後，只在 worktree
     # 把它改成「首頁」，digest 完全不變，於是可以產生一份內容完整性無誤、
     # 但驗證範圍從未被批准的 browser evidence。
-    h.update(b'Critical user journeys\0'+journeys_canonical(root).encode()+b'\0')
+    h.update(b'Critical user journeys\0'+journeys_canonical_in(text).encode()+b'\0')
     return unresolved, invalid, resolved, h.hexdigest()
 
 
@@ -1184,12 +1215,15 @@ def journeys_status(root:Path):
     能力邊界（必須明講）：這只能驗證**宣稱**，不能驗證那些 journey 真的被執行過。
     誠實執行仍是既有的能力邊界，見 GATES.md。
     """
-    p = root/'PROJECT-PROFILE.md'
-    if not p.exists(): return [], []
+    return journeys_status_in(profile_text(root))
+
+
+def journeys_status_in(text):
+    if text is None: return [], []
     # **先剝掉 HTML 註解。** 本檔在這個區段用註解放範例（`- [J1] 訪客可以…`），
     # 不剝的話那些範例會被當成真的 journey —— 一份全新的 profile 會憑空「已定義」
     # 兩個沒人寫過的 journey，而 WEB 專案的必填檢查也會被它們矇混過去。
-    text = re.sub(r'<!--.*?-->', '', p.read_text(encoding='utf-8'), flags=re.S)
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.S)
     m = re.search(r'^##\s*Critical user journeys\s*$(.*?)(?=^##\s|\Z)', text, re.M|re.S)
     if not m: return [], []
     out=[]; errors=[]; seen={}
@@ -1222,9 +1256,18 @@ def critical_journeys(root:Path):
     return j
 
 
-def journeys_canonical(root:Path)->str:
+def critical_journeys_in(text):
+    j, _ = journeys_status_in(text)
+    return j
+
+
+def journeys_canonical_in(text)->str:
     """journeys 進 digest 用的正規化形式。ID 排序，避免順序調換就撤銷批准。"""
-    return '\n'.join(f'{jid}\t{desc}' for jid, desc in sorted(critical_journeys(root)))
+    return '\n'.join(f'{jid}\t{desc}' for jid, desc in sorted(critical_journeys_in(text)))
+
+
+def journeys_canonical(root:Path)->str:
+    return journeys_canonical_in(profile_text(root))
 
 
 PROGRESS_LINE_RE=re.compile(r'^(\s*[-*]\s*\[)[ xX](\])', re.M)
@@ -1272,7 +1315,11 @@ def _git_out(root:Path, args, text=False):
 
 
 def _source_paths(root:Path, source:str, prefix:str, is_dir:bool):
-    """該來源底下屬於 prefix 的檔案清單。取不到（非 git repo / 無 HEAD）回 None。
+    """該來源底下屬於 prefix 的檔案清單。取不到（非 git repo / 無此 ref）回 None。
+
+    `source` 是 'worktree'、'index'，或**任何 git ref**（'HEAD'、commit SHA…）。
+    支援任意 ref 是為了 CI 稽核：那裡要對「某一個 commit 的樹」求值，
+    而不是對開發者機器上的三態求值。
 
     **路徑集合必須逐來源列舉**，不能拿 worktree 的清單去讀另外兩個來源 ——
     否則 index 多出一個 worktree 沒有的檔案時，那個檔案不會進入 digest。
@@ -1284,7 +1331,7 @@ def _source_paths(root:Path, source:str, prefix:str, is_dir:bool):
         if not d.is_dir(): return []
         return [q.relative_to(root).as_posix() for q in d.rglob('*') if q.is_file()]
     args = (['ls-files','-z','--',prefix] if source=='index'
-            else ['ls-tree','-r','--name-only','-z','HEAD','--',prefix])
+            else ['ls-tree','-r','--name-only','-z',source,'--',prefix])
     out = _git_out(root, args, text=True)
     if out is None: return None
     return [x for x in out.split('\0') if x]
@@ -1294,7 +1341,7 @@ def _read_from(root:Path, source:str, rel:str):
     if source=='worktree':
         try: return (root/rel).read_bytes()
         except OSError: return None
-    return _git_out(root, ['show', (':'+rel) if source=='index' else ('HEAD:'+rel)])
+    return _git_out(root, ['show', (':'+rel) if source=='index' else (source+':'+rel)])
 
 
 def _digest_over(root:Path, source:str, rels, progress_bearing=None):
@@ -1511,6 +1558,62 @@ def approved_profile_status(root:Path, state):
                        '  profile 定案之後要改，必須回 SPECIFICATION 修訂 ADR/OpenSpec '
                        '並重新 review。')
     return True, ''
+
+
+def approved_content_status_at(root:Path, state, ref:str):
+    """在**某一個 commit 的樹**上評估「被批准的內容是否仍與批准一致」。回傳 (ok, reason)。
+
+    與 `approved_content_status` 的差別：一個 commit 只有一棵樹，沒有
+    worktree / index / HEAD 三態可言，所以這裡不做三來源比對，只比 digest。
+    這正是伺服器端比本機乾淨的地方 —— 三態分裂是開發機才有的問題。
+
+    存在的理由：required status check 必須能對「歷史上每一個 commit」判斷當時的
+    產品變更是否被授權。只驗 PR 的最終樹不足以證明中間沒有先寫產品、後補批准。
+    """
+    if getattr(state,'profile_digest','none')=='none':
+        return False, 'STATE 沒有記錄批准時的 PROJECT-PROFILE digest'
+    ptext = profile_text(root, ref)
+    if ptext is None:
+        return False, 'PROJECT-PROFILE.md 在這個 commit 不存在或非 UTF-8'
+    unresolved, invalid, _, cur = profile_resolution_in(ptext)
+    if unresolved or invalid:
+        return False, ('PROJECT-PROFILE.md 在這個 commit 無法產生 digest'
+                       f'（未解析：{unresolved or "無"}；非法值：'
+                       f'{[n for n,_,_ in invalid] or "無"}）')
+    if cur != state.profile_digest:
+        return False, ('PROJECT-PROFILE.md 與 STATE 記錄的批准內容不一致'
+                       f'（批准 {state.profile_digest[:16]}、此 commit {cur[:16]}）')
+    change = getattr(state,'active_change','none')
+    if state.spec_approved=='yes':
+        if state.spec_digest=='none':
+            return False, 'STATE 宣稱 spec 已批准，卻沒有記錄批准時的 digest'
+        got = content_digest(root, f'openspec/changes/{change}', True,
+                             _is_progress_bearing_spec_file, source=ref)
+        if got is None:
+            return False, f'openspec/changes/{change} 在這個 commit 不存在或無法解碼'
+        if got != state.spec_digest:
+            return False, ('OpenSpec change 內容與 STATE 記錄的批准不一致'
+                           f'（批准 {state.spec_digest[:16]}、此 commit {got[:16]}）')
+    if state.test_design_approved=='yes':
+        if state.test_design_digest=='none':
+            return False, 'STATE 宣稱 test design 已批准，卻沒有記錄批准時的 digest'
+        got = content_digest(root, f'workflow/test-cases/{change}.md', False,
+                             lambda rel: True, source=ref)
+        if got is None:
+            return False, f'workflow/test-cases/{change}.md 在這個 commit 不存在或無法解碼'
+        if got != state.test_design_digest:
+            return False, ('Test design 內容與 STATE 記錄的批准不一致'
+                           f'（批准 {state.test_design_digest[:16]}、此 commit {got[:16]}）')
+    return True, ''
+
+
+def implementation_authorized_at(root:Path, state, ref:str):
+    """伺服器端版本的 implementation_authorized。判準與本機同源。"""
+    if not state.implementation_allowed:
+        return False, (f'Phase={state.phase}、Spec approved={state.spec_approved}、'
+                       f'Test design approved={state.test_design_approved} —— '
+                       '此 commit 當下不允許實作')
+    return approved_content_status_at(root, state, ref)
 
 
 def implementation_authorized(root:Path, state):
@@ -1750,12 +1853,14 @@ def plan_checks(root:Path, mode:str='full')->list:
     return plan
 
 
-def project_web_status(root:Path)->str:
-    p=root/'PROJECT-PROFILE.md'
-    if not p.exists(): return 'UNRESOLVED'
-    text=p.read_text(encoding='utf-8')
+def project_web_status(root:Path,source:str='worktree')->str:
+    return project_web_status_in(profile_text(root,source))
+
+
+def project_web_status_in(text)->str:
+    if text is None: return 'UNRESOLVED'
     def field(name):
-        m=re.search(rf"^{re.escape(name)}:[ \t]*(.*?)[ \t]*$",text,re.M); return m.group(1).strip() if m else None
+        return _field_in(text,name)
     typ,req=field('Type'),field('Web verification required')
     if typ is None or req is None:return 'UNRESOLVED'
     # 無法辨識的 Type 一律 fail-closed。這是決定 Browser Gate 開關的那一層，

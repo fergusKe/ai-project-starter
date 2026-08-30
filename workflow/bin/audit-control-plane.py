@@ -2,10 +2,99 @@
 from pathlib import Path
 import argparse,re,subprocess,sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
-from workflow_state import audit_commit_changes,change_touches_control_plane,control_plane_digest,parse_state_text,installation_baseline,AUDIT_FAIL_CLOSED_PHASE
+from workflow_state import (audit_commit_changes,change_touches_control_plane,control_plane_digest,
+ parse_state_text,installation_baseline,AUDIT_FAIL_CLOSED_PHASE,
+ path_is_ai_writable_non_product,evidence_write_allowed,implementation_authorized_at,
+ path_is_installation_scaffolding,
+ state_hash_text,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE)
 STATE_PATH='workflow/STATE.md';LOG_PATH='workflow/state-log.md'
 
 def g(*a,text=True):return subprocess.run(['git','-C',str(ROOT),*a],capture_output=True,text=text)
+
+def state_at(commit):
+ """該 commit 的完整 STATE。取不到或壞掉回 None。"""
+ r=g('show',f'{commit}:{STATE_PATH}')
+ if r.returncode!=0:return None
+ try:return parse_state_text(r.stdout)
+ except Exception:return None
+
+def state_text_at(commit):
+ r=g('show',f'{commit}:{STATE_PATH}')
+ return r.stdout if r.returncode==0 else None
+
+def workflow_authorization_violations(commit,changes,state,installing=False):
+ """逐 commit 的工作流授權稽核 —— 這是 required check 真正的內容。
+
+ 沒有這一段的話，`--no-verify` 繞過本機 gate 之後，伺服器端只會看到
+ 「沒有 Control Plane mutation」而輸出 OK：DISCOVERY 階段、零批准的產品程式碼
+ 可以直接合併。那會讓 MERGE-PROTECTION.md 的宣稱變成一句沒有機制支撐的話。
+
+ 四類（與本機 gate 同源的判準）：
+   1. STATE 變更必須同時附上 state-log，且 hash 對得起來
+   2. Control Plane transition 不得與產品程式碼同一個 commit
+   3. 產品變更必須在該 commit 當下就已被授權
+   4. evidence 只能由 active change 在 ENGINEERING/VERIFICATION 寫入
+ """
+ out=[]
+ touches_state=any(STATE_PATH in ch.paths for ch in changes)
+ touches_log=any(LOG_PATH in ch.paths for ch in changes)
+
+ if touches_state:
+  if not touches_log:
+   out.append('STATE 變更沒有同時附上 state-log —— 無法證明這次變更經過任何 transition')
+  else:
+   stext=state_text_at(commit);raw=log_bytes(commit)
+   if stext is None or raw is None:
+    out.append('無法讀取此 commit 的 STATE / state-log')
+   else:
+    try:ltext=raw.decode('utf-8')
+    except UnicodeDecodeError:ltext=None
+    if ltext is None:
+     out.append('state-log 非 UTF-8')
+    else:
+     hashes=re.findall(r'^- State hash:\s*([0-9a-f]{64})\s*$',ltext,re.M)
+     if not hashes or hashes[-1]!=state_hash_text(stext):
+      out.append('STATE hash 與 state-log 最後一筆不一致 —— STATE 被改過但沒有對應的稽核紀錄')
+
+ if state is None:
+  # STATE 讀不出來就無法判斷授權。fail-closed：只有完全不碰產品/evidence 才放行。
+  suspicious=[ch for ch in changes
+              if not all(pp in {STATE_PATH,LOG_PATH} for pp in ch.paths)]
+  if suspicious:
+   out.append('此 commit 的 STATE 無法解析，因此無法證明任何變更被授權')
+  return out
+
+ product=[];evidence=[]
+ for ch in changes:
+  if any(pp in {STATE_PATH,LOG_PATH} for pp in ch.paths):continue
+  # Control Plane 自己的檔案不走「實作授權」這條，它們由 control-plane-commit
+  # （TTY + audit record）管轄，下面的 cp 檢查會驗。本機 gate 同樣是先攔在
+  # exit 20，根本走不到產品迴圈 —— 兩邊的分層必須一致，否則安裝與維護 commit
+  # 會被當成未授權的實作。
+  if change_touches_control_plane(ch,state.phase):continue
+  # 合法的安裝 commit 帶進來的是工具，不是產品功能。沒有這個豁免，Starter 的
+  # 安裝動作會被 Starter 自己的稽核判成「DISCOVERY 階段的未授權實作」。
+  if installing and all(path_is_installation_scaffolding(pp) for pp in ch.paths):continue
+  desc=f'{ch.status}: '+(' -> '.join(ch.paths) if ch.status=='R' else ch.paths[0])
+  is_product=False
+  for pp in ch.paths:
+   if CORE_EVIDENCE_RE.match(pp) or BROWSER_EVIDENCE_RE.match(pp):
+    if not evidence_write_allowed(pp,state):evidence.append(desc)
+    continue
+   if path_is_ai_writable_non_product(pp,state.phase):continue
+   is_product=True
+  if is_product:product.append(desc)
+
+ if evidence:
+  out.append(f'evidence 不在可寫範圍內（change={state.active_change}、phase={state.phase}）：'
+             +'、'.join(sorted(set(evidence))))
+ if product and touches_state:
+  out.append('Control Plane transition 與產品程式碼在同一個 commit：'+'、'.join(product))
+ if product:
+  ok,why=implementation_authorized_at(ROOT,state,commit)
+  if not ok:
+   out.append(f'未授權的產品變更（{why}）：'+'、'.join(product))
+ return out
 
 def state_phase_at(commit):
  r=g('show',f'{commit}:{STATE_PATH}')
@@ -73,13 +162,19 @@ def main():
    bad.append((c,['workflow/state-log.md audit continuity violated']))
    continue
 
+  # 工作流授權稽核。原本 audit 只比對「Control Plane mutation 與 audit record 是否
+  # 一致」，那個宣稱比 MERGE-PROTECTION.md 寫的窄得多：它看不到未經批准的產品變更，
+  # 也刻意把 STATE-only 的變更排除在外。兩者都實測可繞過。
   cp=[ch for ch in changes if change_touches_control_plane(ch,phase) and not all(p in {STATE_PATH,LOG_PATH} for p in ch.paths)]
-  if not cp:continue
-  exp=control_plane_digest(ROOT,cp,c)
-  if not audit_record_matches(c,exp):
-   desc=[]
-   for ch in cp: desc.append(f'{ch.status}: '+(' -> '.join(ch.paths) if ch.status=='R' else ch.paths[0]))
-   bad.append((c,desc))
+  installing=log_has_action(c,'install-adopt-control-plane')
+  problems=workflow_authorization_violations(c,changes,state_at(c),installing)
+  if cp:
+   exp=control_plane_digest(ROOT,cp,c)
+   if not audit_record_matches(c,exp):
+    for ch in cp:
+     problems.append('Control Plane 變更沒有對應的 audit record：'
+                     +(' -> '.join(ch.paths) if ch.status=='R' else ch.paths[0]))
+  if problems:bad.append((c,problems))
  if bad:
   # D-7：若被標記的 commit 早於已辨識的 installation baseline，訊息必須自我說明。
   # 安裝點＝第一個把 workflow/STATE.md 帶進 history 的 commit。
@@ -95,7 +190,7 @@ def main():
    anc=g('rev-list','--ancestry-path',f'{install}..{a.head}')
    later=set(x for x in anc.stdout.splitlines() if x)|{install}
    pre_install=[c for c,_ in bad if c not in later]
-  print('Unauthorized / unaudited Control Plane commits detected:',file=sys.stderr)
+  print('工作流授權稽核失敗（Unauthorized / unaudited commits）：',file=sys.stderr)
   for c,items in bad:
    print(f'- {c}',file=sys.stderr)
    for item in items:print(f'  {item}',file=sys.stderr)

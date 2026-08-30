@@ -301,7 +301,12 @@ class AuditControlPlaneTests(unittest.TestCase):
         base=self.sha();self.git('checkout','-qb','feat')
         p1=self.r/'workflow/bin/check-workflow.sh';p1.write_text(p1.read_text()+'\n# one\n');self.git('add',str(p1.relative_to(self.r)));self.authorized_commit(p1)
         p2=self.r/'workflow/bin/setup-git-hooks.sh';p2.write_text(p2.read_text()+'\n# two\n');self.git('add',str(p2.relative_to(self.r)));self.authorized_commit(p2)
-        self.git('checkout','-q','main');(self.r/'main-only').write_text('m');self.git('add','main-only');self.git('commit','-m','main diverge');self.git('merge','--no-ff','feat','-m','merge feat')
+        self.git('checkout','-q','main')
+        # 分岔用的檔案要放在 AI-writable 路徑。放在 repo 根目錄等於在 DISCOVERY 階段
+        # commit 產品程式碼 —— 那本來就該被工作流授權稽核擋下，會讓這條測試測到別的東西。
+        (self.r/'docs').mkdir(exist_ok=True);(self.r/'docs/main-only.md').write_text('m')
+        self.git('add','docs/main-only.md');self.git('commit','-m','main diverge')
+        self.git('merge','--no-ff','feat','-m','merge feat')
         self.assertGreaterEqual(len(self.git('rev-list','--parents','-n','1','HEAD').stdout.split()),3)
         self.assertEqual(self.audit(base).returncode,0)
 
