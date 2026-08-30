@@ -88,6 +88,12 @@ LIBRARY），Browser Gate 不啟用，`browser.md` 會標記 NOT APPLICABLE。
 這些 request 存成一組集合之後，它同時也是一份可執行的 API 文件 ——
 比寫在 wiki 裡、跟程式漸行漸遠的那種有用得多。
 
+## 相關文件
+
+- `workflow/MERGE-PROTECTION.md`：合併之前的伺服器端執法層
+- `workflow/DEV-ENVIRONMENT.md`：多任務並行、pnpm、套件定期升級
+- `workflow/CI.md`：CI 的涵蓋範圍與形狀要求
+
 ## 已知邊界
 
 - Starter 不驗證部署是否成功、不驗證 image 是否安全、不驗證雲端權限設定。

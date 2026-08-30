@@ -13,7 +13,7 @@ CONTROL_PLANE_PREFIXES=("workflow/bin/","workflow/tests/",".claude/hooks/",".git
 # Starter 的**政策文件**與執法層設定屬於 Control Plane：能改規則的人等於能改結果。
 # MERGE-PROTECTION.md 定義伺服器端執法、github-workflow-control-plane-audit.yml
 # 就是那個 required check 本身 —— 兩者若可被一般 commit 改掉，整層執法可以被安靜地拆除。
-CONTROL_PLANE_FILES={".claude/settings.json","workflow/STATE.md","workflow/state-log.md","workflow/GATES.md","workflow/CI.md","workflow/BROWSER-VERIFICATION.md","workflow/MERGE-PROTECTION.md","workflow/DEPLOYMENT.md","workflow/SHIPPED-MANIFEST.txt","templates/CODEOWNERS.example","templates/test-db-safety.md","templates/github-workflow-control-plane-audit.yml"}
+CONTROL_PLANE_FILES={".claude/settings.json","workflow/STATE.md","workflow/state-log.md","workflow/GATES.md","workflow/CI.md","workflow/BROWSER-VERIFICATION.md","workflow/MERGE-PROTECTION.md","workflow/DEPLOYMENT.md","workflow/DEV-ENVIRONMENT.md","workflow/SHIPPED-MANIFEST.txt","templates/CODEOWNERS.example","templates/test-db-safety.md","templates/github-workflow-control-plane-audit.yml"}
 EARLY_MUTABLE_POLICY_FILES={"PROJECT-PROFILE.md"}
 AI_WRITABLE_PREFIXES=("docs/","openspec/","prompts/",".claude/skills/","workflow/test-cases/")
 AI_WRITABLE_ROOT={"AGENTS.md","CLAUDE.md","CONTEXT.md","README.md","START-HERE.md","SETUP.md",".gitignore"}

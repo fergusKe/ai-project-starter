@@ -91,6 +91,8 @@ Transition CLI 不自動 commit；每次 transition 後先獨立提交 STATE+sta
 
 本機 pre-commit 擋不住 `git commit --no-verify`；伺服器端的 required status check 才是真正的 gate。設定與失敗實測見 `workflow/MERGE-PROTECTION.md`。
 
+多任務並行、套件管理與定期升級見 `workflow/DEV-ENVIRONMENT.md`（worktree + pnpm）。Starter 自己的測試用 `python3 workflow/bin/run-tests.py` 平行執行。
+
 ## 完成
 只有 approved spec/test design、implementation、lint/typecheck/tests/build、Web Gate（適用時）、machine core evidence、browser evidence 與 OpenSpec compliance 全部通過才能 archive。散文式「已完成」不算 evidence。
 
