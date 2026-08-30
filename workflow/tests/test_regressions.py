@@ -4687,7 +4687,7 @@ class RC5Round19Tests(unittest.TestCase):
             for rel in ('workflow/evidence/x/core/20260101T000000Z.md',
                         'workflow/evidence/x/browser.md',
                         'workflow/evidence/x/api.md'):
-                self.assertTrue(W.is_evidence_path(rel),rel)
+                self.assertFalse(W.is_evidence_path(rel),rel)  # 故意弄錯：驗證 required check 擋得住
             self.assertFalse(W.is_evidence_path('workflow/evidence/x/notes.md'))
             self.assertFalse(W.is_evidence_path('src/app.py'))
             # 也不得在 path_is_ai_writable_non_product 被無條件豁免
