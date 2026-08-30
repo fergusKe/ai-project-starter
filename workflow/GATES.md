@@ -752,3 +752,35 @@ baseline 或 PR merge-base 起算。
 （那要走 SPECIFICATION 重新 review）。Brownfield 不受影響 —— 它的驗證入口本來就
 已經在 repo 裡。
 
+## API 專案的端點驗證（rc.5）
+
+`AGENTS.md` 與 `BROWSER-VERIFICATION.md` 都寫著「非 Web 專案標記 NOT APPLICABLE
+只代表不需要瀏覽器，不代表不需要真的跑一次」—— 在此之前那是一句**沒有機制的
+規範**：一個 API 專案只要任一 automated check 通過（lint 也算）就能 archive，
+沒有任何東西證明端點被實際打過。
+
+這與 MERGE-PROTECTION 那次是同一個錯誤：在文件裡寫下 normative 宣稱，卻沒有
+對應的 gate。**規範與機制必須成對出現，否則規範只是願望。**
+
+因此 `Type: API` 現在：
+
+1. 與 WEB 一樣**必須列出 critical user journeys**（納入被批准的 profile digest）
+2. 必須提供 `workflow/evidence/<change>/api.md`，每條 journey 恰好一行：
+
+   ```
+   J1: success=PASS validation=PASS authorization=PASS
+   ```
+
+3. 三類情境缺一不可。`not-applicable` 是合法值 —— 確實沒有權限層的端點不該被
+   逼著造假，但**必須明示**，不能省略。
+
+**權限那一類最容易被跳過，也最容易出事。** 前端把選單做成下拉式，不代表後端擋得住
+手動送出的非法值；前端把按鈕藏起來，不代表後端擋得住直接打 API。
+
+CLI / LIBRARY 等沒有對外流程的類型不適用 —— 強制它們填 journeys 等於製造假資料。
+
+### 能力邊界
+
+與 Browser Gate 完全相同：驗證的是**宣稱涵蓋範圍**，不是那些 request 真的被送出過。
+要擋「寫了 PASS 但沒跑」，需要從測試報告反查，那是下一層工程，rc.5 明確不做。
+

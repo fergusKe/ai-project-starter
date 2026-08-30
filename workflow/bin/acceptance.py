@@ -133,7 +133,7 @@ class Acceptance:
         self.say('DISCOVERY：定案 PROJECT-PROFILE，寫 OpenSpec change')
         p = self.r / 'PROJECT-PROFILE.md'
         t = p.read_text(encoding='utf-8')
-        for a, b in (('Type: UNKNOWN', 'Type: CLI'),
+        for a, b in (('Type: UNKNOWN', 'Type: API'),
                      ('Web verification required: auto', 'Web verification required: no'),
                      ('Primary stack: UNKNOWN', 'Primary stack: Node.js'),
                      ('Package manager: UNKNOWN', 'Package manager: npm'),
@@ -143,6 +143,12 @@ class Acceptance:
             if a not in t:
                 raise Fail(f'PROJECT-PROFILE 模板缺少預期欄位：{a}')
             t = t.replace(a, b)
+        # API 專案必須列出 critical journeys —— 它們決定端點驗證的**範圍**，
+        # 並納入被批准的 profile digest。
+        t = t.replace('## Critical user journeys\n- 尚未定義',
+                      '## Critical user journeys\n'
+                      '- [J1] 呼叫端可以取得問候語\n'
+                      '- [J2] 空白名稱會被後端拒絕')
         p.write_text(t, encoding='utf-8')
 
         # 這裡刻意用 `Core verification policy: auto`（採用者的常見路徑）。
@@ -227,7 +233,19 @@ class Acceptance:
         tasks.write_text(tasks.read_text(encoding='utf-8').replace('- [ ]', '- [x]'),
                          encoding='utf-8')
         self.commit(f'openspec/changes/{CHANGE}/tasks.md', msg='chore: 標記任務完成')
-        print('    ✓ 產品 commit 通過 gate；勾選進度未撤銷批准')
+
+        # API 專案的端點驗證 evidence。三類情境缺一不可 ——
+        # 權限那一類最容易被跳過，也最容易出事。
+        ev = self.r / 'workflow/evidence' / CHANGE
+        ev.mkdir(parents=True, exist_ok=True)
+        (ev / 'api.md').write_text(
+            '# API Verification Evidence\n\n'
+            'J1: success=PASS validation=PASS authorization=not-applicable\n'
+            'J2: success=PASS validation=PASS authorization=not-applicable\n\n'
+            '本專案為純函式庫形式的 API，端點無權限層，故 authorization 標記 '
+            'not-applicable。\n', encoding='utf-8')
+        self.commit(f'workflow/evidence/{CHANGE}/api.md', msg='docs: API 驗證證據')
+        print('    ✓ 產品 commit 通過 gate；勾選進度未撤銷批准；API evidence 已寫入')
 
     def verify_and_archive(self):
         self.say('VERIFICATION → ARCHIVE')
