@@ -2,6 +2,10 @@
 
 這個 Starter 是散發用模板，不假設模板目錄本身就是 Git repo。
 
+**出貨檔案要從 `v1.0` tag 取，依 `workflow/SHIPPED-MANIFEST.txt` 複製** ——
+可直接執行的指令在 `README.md` 的〈快速開始〉。不要 `cp -R` 整個工作目錄：
+那會帶走 `.git` 與開發產物，讓新專案的第一個 commit 就髒掉。
+
 - **Greenfield**：把 Starter shipped files 複製到空專案目錄後，執行 `bash workflow/bin/bootstrap.sh`。
 - **Brownfield**：把 Starter files 放入既有 repo 後，**先**執行 `python3 workflow/bin/workflow_transition.py check-install-conflicts`。若列出 tracked overwrite / Control Plane conflict，依輸出先 merge / adopt，不要直接重跑 bootstrap。
 - 不要在未檢查前用覆蓋式複製破壞既有 `.claude/`、`.githooks/`、`CLAUDE.md` 等檔案；Git 只能還原已追蹤內容。

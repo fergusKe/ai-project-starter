@@ -23,10 +23,15 @@ python3 workflow/bin/workflow_transition.py approve-spec <change>
 |---|---|
 | Terminal.app / iTerm / VS Code 內建終端機 | ✅ |
 | Claude Code 對話框的 `!` 前綴 | ❌ stdin 不是 TTY |
-| 任何 `subprocess` / CI / 腳本 | ❌（這正是重點） |
+| 一般 `subprocess` / CI / 腳本 | ❌（這正是重點） |
 
-**這是刻意的。** 那道邊界就是「AI 不能自己批准」的實作 —— 如果程式呼叫也能通過，
-整個 Human Approval 就只是一個可以被腳本填答的表單。
+**這是刻意的。** 如果一般程式呼叫也能通過，整個 Human Approval 就只是一個
+可以被腳本填答的表單。
+
+但要把話說準：**這不是「程式絕對拿不到 controlling terminal」。** 刻意配置 pty
+的程式可以（Starter 自己的 `workflow/bin/acceptance.py` 就是這樣跑 release
+驗收的）。它擋的是**沒有刻意去繞的非互動執行環境** —— 也就是絕大多數 agent
+與 CI 的預設形狀。
 
 先用 `doctor` 確認你的環境可以批准：
 

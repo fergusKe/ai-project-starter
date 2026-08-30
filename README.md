@@ -1,6 +1,7 @@
 # AI Project Starter
 
-> **v1.0-rc.5** — 經 19 輪對抗審查（12 次拒簽）後由審查者正式 sign-off，現為 feature freeze。
+> **v1.0** — 經 20 輪對抗審查（12 次拒簽）後由審查者正式 sign-off。
+> 功能凍結：只收 release blocker 修正、回歸測試與文件一致性修正。
 
 給 Claude Code、Codex 與其他 AI Coding Agent 使用的**規格驅動開發 Starter**。
 
@@ -15,7 +16,8 @@
 **是那個有 shell 權限的 AI 助理本身**，不是外部駭客。這決定了整個設計 ——
 每一層都假設「被守的東西碰得到守衛」：
 
-- 批准要**人類在真實終端機**輸入（程式呼叫拿不到 controlling terminal）
+- 批准要**在真實終端機**輸入 —— 擋掉一般非互動的 agent / CI / 腳本呼叫
+  （這是**已驗證的非互動邊界**，不是人類身分認證，見 `SETUP.md`）
 - 批准綁的是**內容的指紋**，不是 yes/no 旗標 —— 不能先批一份小規格再換掉檔案
 - 閘門從 **HEAD** 重新驗，不看工作目錄 —— 本機改檔案騙不到它
 - 狀態檔用雜湊串成 append-only 日誌，改了會對不上
@@ -46,12 +48,31 @@ DISCOVERY → SPECIFICATION → SPEC_REVIEW → TEST_DESIGN
 
 ## 快速開始
 
+### 1. 取得出貨檔案
+
+**從 `v1.0` tag 取，不要複製工作目錄。** 直接 `cp -R` 整個目錄會帶走 `.git`、
+`__pycache__` 與開發用的 review 文件 —— 那些不是出貨內容，而且會讓新專案的
+第一個 commit 就髒掉。`workflow/SHIPPED-MANIFEST.txt` 是唯一的出貨清單。
+
 ```bash
-# 1. 把 Starter 的出貨檔案複製進你的專案（清單見 workflow/SHIPPED-MANIFEST.txt）
-# 2. 安裝
+# 取一份 v1.0 的乾淨副本（放哪裡都行，用完可刪）
+git clone --depth 1 --branch v1.0 \
+  https://github.com/fergusKe/ai-project-starter.git /tmp/starter-v1.0
+
+# 依出貨清單複製進你的專案（清單裡都是 repo 根層的路徑）
+cd /path/to/your-project
+while IFS= read -r p; do
+  p="${p%$'\r'}"; [ -z "$p" ] && continue; case "$p" in "#"*) continue;; esac
+  cp -R "/tmp/starter-v1.0/${p%/}" ./
+done < /tmp/starter-v1.0/workflow/SHIPPED-MANIFEST.txt
+```
+
+### 2. 安裝與確認
+
+```bash
 bash ./workflow/bin/bootstrap.sh
 
-# 3. 確認 gate 真的生效
+# 確認 gate 真的生效
 python3 workflow/bin/workflow_transition.py doctor    # 要看到 Repository enforcement: ACTIVE
 python3 workflow/bin/workflow_transition.py status    # 目前在哪個階段
 ```
@@ -74,8 +95,10 @@ python3 workflow/bin/workflow_transition.py approve-spec <change>
 ```
 
 在 Claude Code 對話框裡用 `!` 前綴執行**不會成功** —— 那裡的 stdin 不是 TTY。
-請開 Terminal / iTerm / VS Code 終端機。這是刻意的：那道邊界正是「AI 不能自己批准」
-的實作。
+請開 Terminal / iTerm / VS Code 終端機。
+
+這道邊界擋的是**一般非互動執行環境**，不是「程式絕對拿不到 TTY」——
+能力邊界寫在 `SETUP.md`，請不要把它當成人類身分認證。
 
 **送審之前就要 commit，不是批准之前。**
 
@@ -94,7 +117,7 @@ python3 workflow/bin/workflow_transition.py submit-for-review <change>
 | 你想知道 | 看 |
 |---|---|
 | 每個階段該做什麼 | `START-HERE.md` |
-| 給 AI 的 normative 規範 | `AGENTS.md`（唯一權威） |
+| 給 AI 的 normative 規範 | `AGENTS.md`（本 repo 內唯一 normative workflow 權威） |
 | Gate 判準、信任邊界、**所有已知限制** | `workflow/GATES.md` |
 | 伺服器端執法怎麼設、怎麼實測 | `workflow/MERGE-PROTECTION.md` |
 | CI 的涵蓋範圍與形狀要求 | `workflow/CI.md` |
