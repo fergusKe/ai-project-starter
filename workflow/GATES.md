@@ -784,3 +784,50 @@ CLI / LIBRARY 等沒有對外流程的類型不適用 —— 強制它們填 jou
 與 Browser Gate 完全相同：驗證的是**宣稱涵蓋範圍**，不是那些 request 真的被送出過。
 要擋「寫了 PASS 但沒跑」，需要從測試報告反查，那是下一層工程，rc.5 明確不做。
 
+## 新增一種東西時，所有消費端都要一起更新（rc.5）
+
+加入 `api.md` 之後，`API_EVIDENCE_RE` 進了 `evidence_write_allowed`，但
+`check-implementation-gate.py`、`audit-control-plane.py` 與 guard hook 仍各自列著
+`CORE / BROWSER`，而 `path_is_ai_writable_non_product` 又把 `api.md` 無條件豁免。
+結果是**已封存的 API evidence 可以被一般 commit 自由改寫**，本機與伺服器端都沒意見。
+
+判準因此收斂成單一 canonical predicate `is_evidence_path()`，所有消費端共用；
+evidence 不再由 `path_is_ai_writable_non_product` 豁免，一律走
+`evidence_write_allowed` 的所有權判準。**各自列舉的地方一定會漏掉新加的那一種。**
+
+同一輪的另外兩條也是加 API 驗證時製造的：
+
+- **`api.md` 沒被 verification-pass 釘住**。`archive` 重跑 `validate_api` 只證明
+  「現在這份也合法」，不證明「這份就是驗收當時那一份」——
+  第十四輪 browser evidence 修過的同一類 provenance bug。現在記
+  `API evidence sha256`，舊 log 缺欄位時 fail-closed；`revert-to-spec` 也一併 stale。
+- **`not-applicable` 原本三類通用**。逃生口是給「確實沒有權限概念的端點」，
+  不是讓 success 與 validation 也免驗 —— 三類全填 `not-applicable` 可以在零 PASS
+  的情況下 archive。現在只有 `authorization` 接受它。
+
+## 「歷史上出現過」不等於「這一次發生了」（rc.5）
+
+state-log 是 append-only，所以在整份累積 log 裡搜尋任何東西都是錯的語意。
+兩個地方吃過同一個虧：
+
+1. **安裝豁免**：`log_has_action(c,'install-adopt-control-plane')` 讓豁免在第一次
+   安裝之後永久生效。
+2. **`audit_record_matches`**：舊 record 的 digest 可以被重用 —— 把檔案改回從前某個
+   授權過的內容 B，mutation path / status / resulting bytes 都相同，digest 因此相同，
+   audit 在歷史裡找到那筆舊 record 就放行，而這一次的變更從未被任何人授權。
+
+兩者都改用 `appended_log_text(commit)`（`after[len(before):]`，不連續就 fail-closed）。
+安裝宣告另外要求 block **形狀完整**（Actor/Change/From/To/Git SHA/State hash/Reason
+齊備）—— 只找到一行 action 的話，同一個 commit 裡人工追加一行假的就能打開豁免。
+
+`log_has_action` 已刪除。實作了錯誤語意的死程式碼是留給下一個人的坑。
+
+## Guard hook 自己必須 fail-closed（rc.5）
+
+PreToolUse hook 非零退出（非 exit 2）**不會阻擋工具呼叫** —— 也就是說 guard 崩掉
+等於放行。實際踩到過：改 import 時漏掉一個名稱，`NameError` 讓整支程式沒有輸出，
+而所有寫入都被視為允許，測試也因此以為「hook 沒有拒絕」。
+
+**守衛壞掉必須是拒絕，不是沉默。** 整支 hook 現在包在 try/except 裡，
+任何未預期例外都轉成 deny。
+
