@@ -81,7 +81,12 @@ def _sha256(path):
  return h.hexdigest()
 
 def _accepted_evidence_from_log(change):
- """從 state-log 取出最後一次 verification-pass 所接受的 evidence 路徑與 digest。"""
+ """從 state-log 取出最後一次 verification-pass 所接受的 evidence。
+
+ 回傳 `(core_rel, core_sha256, browser_sha256_or_None)`。browser 為 None 表示
+ 該筆記錄早於本欄位存在 —— 呼叫端必須 fail-closed 要求重跑，不得當成
+ 「沒有 browser evidence 要驗」。
+ """
  if not LOG.exists():return None
  blocks=re.split(r'(?m)^## ',LOG.read_text(encoding='utf-8'))[1:]
  for block in reversed(blocks):
@@ -89,7 +94,8 @@ def _accepted_evidence_from_log(change):
   if not re.search(rf'(?m)^- Change:[ \t]*{re.escape(change)}[ \t]*$',block):continue
   path=re.search(r'(?m)^- Core evidence:[ \t]*(.*?)[ \t]*$',block)
   digest=re.search(r'(?m)^- Core evidence sha256:[ \t]*([0-9a-f]{64})[ \t]*$',block)
-  if path and digest:return path.group(1),digest.group(1)
+  bdigest=re.search(r'(?m)^- Browser evidence sha256:[ \t]*([0-9a-f]{64})[ \t]*$',block)
+  if path and digest:return path.group(1),digest.group(1),(bdigest.group(1) if bdigest else None)
   return None
  return None
 
@@ -344,8 +350,15 @@ def cmd_verification_pass(a):
  validate_browser(a.change)
  rel=str(c.relative_to(ROOT))
  write_state(STATE,replace(s,phase='VERIFICATION',verification_passed='yes',last_updated=now_iso()))
+ # browser.md 也必須被釘住。它是 **AI-writable** 而 core evidence 是 machine-owned，
+ # 所以不對稱的是：被釘住的那一份反而是 AI 動不了的，沒被釘住的那一份 AI 可以改。
+ # 只靠 archive 重跑 validate_browser 不夠 —— 那只證明「現在這份也合法」，
+ # 不證明「這份就是 verification-pass 當時驗收的那一份」。
+ bf=browser_file(a.change); bdigest=_sha256(bf)
+ if bdigest is None:die('無法計算 browser evidence digest',54)
  append_log('verification-pass','machine-verified',s.phase,'VERIFICATION',a.change,'Core/browser evidence validated',
-            extra={'Core evidence':rel,'Core evidence sha256':digest})
+            extra={'Core evidence':rel,'Core evidence sha256':digest,
+                   'Browser evidence sha256':bdigest})
  print('Transition complete: verification-pass')
  print(f'Accepted core evidence: {rel}')
  print('NEXT REQUIRED ACTION: 先獨立提交 workflow/STATE.md 與 workflow/state-log.md，再進行下一階段工作。')
@@ -357,7 +370,7 @@ def cmd_archive(a):
  if not ok:die(f'archive 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
  accepted=_accepted_evidence_from_log(a.change)
  if accepted is None:die('state-log 找不到 verification-pass 所接受的 core evidence 記錄；請重跑 verification-pass',51)
- rel,expected=accepted
+ rel,expected,expected_browser=accepted
  canonical=f'workflow/evidence/{a.change}/core/'
  if not rel.startswith(canonical) or '..' in rel:
   die(f'state-log 記錄的 evidence 路徑不在 canonical 位置（{canonical}）：{rel}',51)
@@ -371,7 +384,18 @@ def cmd_archive(a):
  if actual!=expected:die(f'core evidence 已被更動：{rel}（digest 不符）',51)
  ok,why=core_evidence_status(c,a.change)
  if not ok:die(f'core evidence 未通過：{why}',51)
- validate_browser(a.change);transition(s,replace(s,phase='ARCHIVE',last_updated=now_iso()),'archive','machine-verified','Evidence complete')
+ validate_browser(a.change)
+ # 釘住的那一份必須就是現在這一份。缺記錄的是舊 log（本欄位之前產生的），一律要求重跑。
+ if expected_browser is None:
+  die('state-log 的 verification-pass 記錄沒有 Browser evidence sha256；'
+      '該記錄早於本欄位存在，請重跑 verification-pass',51)
+ got_browser=_sha256(browser_file(a.change))
+ if got_browser!=expected_browser:
+  die('browser evidence 與 verification-pass 當時驗收的那一份不符。\n'
+      f'  驗收時 sha256: {expected_browser[:16]}\n'
+      f'  目前 sha256:   {(got_browser or "（無法計算）")[:16]}\n'
+      '  browser.md 是 AI-writable，因此必須釘住；請重跑 verification-pass。',51)
+ transition(s,replace(s,phase='ARCHIVE',last_updated=now_iso()),'archive','machine-verified','Evidence complete')
 def cmd_revert(a):
  s=parse_state(STATE)
  if s.phase=='ARCHIVE':die('已 ARCHIVE 的 change 不可 revert；請建立新的 OpenSpec change',58)

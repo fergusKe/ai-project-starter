@@ -21,10 +21,17 @@ def stamp_approved_profile(r):
     """
     import re as _re, sys as _sys
     pp=r/'PROJECT-PROFILE.md'; txt=pp.read_text(encoding='utf-8')
-    for k,v in (('Type','CLI'),('Web verification required','no'),
-                ('Primary stack','Python 3.12'),('Package manager','uv'),
-                ('Monorepo','no'),('CI provider','GitHub Actions'),
-                ('Test database strategy','not-applicable')):
+    # **只補尚未決定的欄位。** 呼叫端可能刻意設了 Type / Web verification required
+    # 來測某個分支；覆蓋掉它們會讓那些測試安靜地測到別的東西。
+    for k,v,undecided in (('Type','CLI',('UNKNOWN',)),
+                          ('Web verification required','no',('auto',)),
+                          ('Primary stack','Python 3.12',('UNKNOWN',)),
+                          ('Package manager','uv',('UNKNOWN',)),
+                          ('Monorepo','no',('UNKNOWN',)),
+                          ('CI provider','GitHub Actions',('UNKNOWN',)),
+                          ('Test database strategy','not-applicable',('UNKNOWN',))):
+        m=_re.search(rf'^{_re.escape(k)}:[ \t]*(.*?)[ \t]*$',txt,flags=_re.M)
+        if m and m.group(1) not in undecided: continue
         txt=_re.sub(rf'^{_re.escape(k)}:[ \t]*.*$',f'{k}: {v}',txt,count=1,flags=_re.M)
     pp.write_text(txt,encoding='utf-8')
     _sys.path.insert(0,str(r/'workflow/bin'))
@@ -70,6 +77,9 @@ class HookDecisionTests(unittest.TestCase):
         q=re.sub(r"^Type:.*$",f"Type: {typ}",q,flags=re.M)
         q=re.sub(r"^Web verification required:.*$",f"Web verification required: {web}",q,flags=re.M)
         pr.write_text(q)
+        # ENGINEERING 現在還包含「profile 與人類批准的內容一致」。fixture 只設
+        # phase 與兩個 approval flag 的話，模擬出來的是一個真實流程不會產生的狀態。
+        stamp_approved_profile(self.r)
     def hook(self,rel):
         payload=json.dumps({"tool_name":"Write","tool_input":{"file_path":str(self.r/rel)}})
         x=subprocess.run(["python3",".claude/hooks/guard-workflow-gate.py"],cwd=self.r,input=payload,capture_output=True,text=True)
@@ -3283,6 +3293,69 @@ class RC5Round13Tests(unittest.TestCase):
             finally:
                 sys.path.remove(str(r/'workflow/bin'))
                 sys.modules.pop('wt_prov',None)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_claude_write_guard_uses_the_same_predicate(self):
+        """即時回饋層必須與 pre-commit gate 同一條判準。
+
+        `.claude/**` 不是 enforcement（見 GATES.md），但回饋錯了比沒有回饋更糟 ——
+        guard 說「可以寫」、pre-commit 說「不能 commit」，agent 會白做一整輪工。
+        """
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            payload=json.dumps({'tool_input':{'file_path':str(r/'src/app.py')}})
+            def run_guard():
+                return subprocess.run(['python3','.claude/hooks/guard-workflow-gate.py'],
+                                      cwd=r,input=payload,capture_output=True,text=True)
+            x=run_guard()
+            self.assertNotIn('"permissionDecision": "deny"',x.stdout,
+                             '前提：批准狀態一致時應該放行\n'+x.stdout+x.stderr)
+            # profile 被換成人類沒批准過的內容 → 必須跟著拒絕
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='temporarily skip')
+            y=run_guard()
+            self.assertIn('deny',y.stdout,'profile 已被換掉，guard 必須拒絕\n'+y.stdout+y.stderr)
+            self.assertIn('與人類批准的內容不一致',y.stdout,y.stdout)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_browser_evidence_is_pinned_like_core_evidence(self):
+        """browser.md 是 **AI-writable**，卻是 archive 的前提之一。
+
+        只靠 archive 重跑 validate_browser 不夠 —— 那只證明「現在這份也合法」，
+        不證明「這份就是 verification-pass 當時驗收的那一份」。
+        """
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            v=self._run(r,'verification-pass','demo')
+            self.assertEqual(v.returncode,0,v.stdout+v.stderr)
+            log=(r/'workflow/state-log.md').read_text(encoding='utf-8')
+            self.assertIn('- Browser evidence sha256: ',log,
+                          'verification-pass 必須把 browser evidence 一併釘住\n'+log[-600:])
+            bf=r/'workflow/evidence/demo/browser.md'
+            # 換成另一份「內容仍然合法」的 browser.md —— 這正是 AI 做得到的事
+            bf.write_text(bf.read_text(encoding='utf-8')+'\n附註：事後追加的說明\n',encoding='utf-8')
+            x=self._run(r,'archive','demo')
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,'被換過的 browser evidence 不得被 archive 接受\n'+out)
+            self.assertIn('browser evidence 與 verification-pass 當時驗收的那一份不符',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_archive_rejects_log_record_without_browser_digest(self):
+        """舊 log 沒有這個欄位時必須 fail-closed，不得當成「沒有 browser evidence 要驗」。"""
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            v=self._run(r,'verification-pass','demo')
+            self.assertEqual(v.returncode,0,v.stdout+v.stderr)
+            lg=r/'workflow/state-log.md'
+            lg.write_text(re.sub(r'^- Browser evidence sha256:.*\n','',
+                                 lg.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            x=self._run(r,'archive','demo')
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('請重跑 verification-pass',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_honest_flow_still_reaches_archive(self):

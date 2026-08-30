@@ -2,7 +2,7 @@
 import json,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
-from workflow_state import parse_state,path_is_control_plane,path_is_ai_writable_non_product,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,project_web_status
+from workflow_state import parse_state,path_is_control_plane,path_is_ai_writable_non_product,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,project_web_status,implementation_authorized
 def deny(msg):print(json.dumps({'hookSpecificOutput':{'hookEventName':'PreToolUse','permissionDecision':'deny','permissionDecisionReason':msg}},ensure_ascii=False));sys.exit(0)
 try:payload=json.load(sys.stdin)
 except Exception:payload={}
@@ -16,5 +16,9 @@ if CORE_EVIDENCE_RE.match(rel):deny(f'Machine-owned core evidence 不允許 AI W
 if BROWSER_EVIDENCE_RE.match(rel) and project_web_status(ROOT)!='WEB':deny(f'只有 WEB 專案允許 AI 寫 browser.md：{rel}')
 if path_is_control_plane(rel,s.phase):deny(f'Control Plane 不允許一般 AI Write/Edit：{rel}')
 if path_is_ai_writable_non_product(rel,s.phase):sys.exit(0)
-if s.implementation_allowed:sys.exit(0)
-deny(f'Derived Implementation allowed=no；目前不得修改產品程式碼：{rel}')
+# 必須與 pre-commit gate 用同一條判準。只看 derived flag 的話，這個 hook 會說
+# 「可以寫」，然後 pre-commit 說「不能 commit」—— agent 白做一整輪工。
+# 這一層是即時回饋不是 enforcement（見 GATES.md），但回饋錯了比沒有回饋更糟。
+ok,why=implementation_authorized(ROOT,s)
+if ok:sys.exit(0)
+deny(f'{why}；目前不得修改產品程式碼：{rel}')
