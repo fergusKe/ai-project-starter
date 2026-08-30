@@ -48,13 +48,19 @@ npm install -g pnpm
 pnpm install
 ```
 
-### 導入時要考慮向前相容
+### 但不要讓兩份 lockfile 並存
 
-不是所有人都用 pnpm。導入新工具建議以**最小影響範圍**進行 ——
-例如 npm / pnpm 雙 lockfile 並行，讓兩種安裝方式都能啟動專案，
-而不是直接把別人的工作流換掉。
+導入新工具要以最小影響範圍進行 —— **但「兩份 lockfile 並行」不是最小影響，
+是兩個 source of truth。** `package-lock.json` 與 `pnpm-lock.yaml` 可能解析出
+不同的相依圖，於是「在我機器上可以跑」換了個形式回來，而且更難查。
 
-`PROJECT-PROFILE.md` 的 `Package manager` 欄位記錄專案實際採用的是哪一個。
+遷移期要明確選定**唯一**權威的 package manager，只提交它的 lockfile，
+CI 用 frozen / immutable install（安裝失敗好過安靜地裝成另一套）。
+
+版本本身也要釘住。`npm install -g pnpm` 沒有指定版本，跟可重現性的目標相反 ——
+用 `package.json` 的 `packageManager` 欄位宣告版本，讓每個人與 CI 拿到同一個。
+
+`PROJECT-PROFILE.md` 的 `Package manager` 欄位記錄專案採用哪一個。
 它是被批准的 profile 的一部分，改它要走 SPECIFICATION。
 
 ## 同一條原則：沒有依賴關係的事就同時做
@@ -96,7 +102,10 @@ python3 workflow/bin/run-tests.py -k Round16
 實務上：
 
 - 用 Context7 之類的工具取得套件的**最新**文件，不要依賴模型的訓練資料
-- 升級是高風險、涉及範圍大的變更，走完整的 OpenSpec 流程
+- **依影響決定流程，不要一律走完整 OpenSpec。** 會改變可觀察行為、安全契約或
+  被批准範圍的升級（大版本、行為有 breaking change、換掉驗證相關的相依）
+  要回 OpenSpec 重新 review；純維護性升級（patch、安全修補、無行為變更）
+  走工程 maintenance change 即可。一律要求完整流程只會讓人不做升級。
 - 升完不要只看測試綠燈，**親手跑一次**啟動與主要流程
 
 ## 為什麼這些不是 gate

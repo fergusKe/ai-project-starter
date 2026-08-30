@@ -126,9 +126,10 @@ sys.exit(0)
               ('Test database strategy: UNKNOWN','Test database strategy: not-applicable')):
    t=t.replace(a,b)
   p.write_text(t);
-  for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.assertEqual(self.cli(*a).returncode,0);self.assertEqual(self.commit_transition(a[0]).returncode,0)
-  # 批准之前，被批准的內容必須已經在 HEAD 且三來源一致。
+  # **送審之前**（不是批准之前）內容就必須在 HEAD：PROJECT-PROFILE.md 一進
+  # SPEC_REVIEW 就變成唯讀的 Control Plane，那時再 commit 已經來不及。
   self.assertEqual(self.commit_paths('PROJECT-PROFILE.md','openspec/changes/demo',msg='spec artifacts').returncode,0)
+  for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.assertEqual(self.cli(*a).returncode,0);self.assertEqual(self.commit_transition(a[0]).returncode,0)
   self.approve_internal('spec');self.assertEqual(self.commit_transition('approve spec').returncode,0)
   (self.r/'workflow/test-cases/demo.md').write_text('cases')
   self.assertEqual(self.commit_paths('workflow/test-cases/demo.md',msg='test design').returncode,0)
@@ -149,8 +150,8 @@ sys.exit(0)
  def test_no_tty_approval(self):
   # front half to review
   p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: UNKNOWN','Type: API').replace('Web verification required: auto','Web verification required: no').replace('Primary stack: UNKNOWN','Primary stack: Python 3.12').replace('Package manager: UNKNOWN','Package manager: uv').replace('Monorepo: UNKNOWN','Monorepo: no').replace('CI provider: UNKNOWN','CI provider: GitHub Actions').replace('Test database strategy: UNKNOWN','Test database strategy: not-applicable'));
-  for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.cli(*a);self.commit_transition(a[0])
   self.commit_paths('PROJECT-PROFILE.md','openspec/changes/demo',msg='spec artifacts')
+  for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.cli(*a);self.commit_transition(a[0])
   self.assertEqual(self.cli('approve-spec','demo').returncode,20)
  def test_unknown_auto_fails_closed(self):
   self.prep_to_engineering(False);p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: API','Type: UNKNOWN').replace('Web verification required: no','Web verification required: auto'))

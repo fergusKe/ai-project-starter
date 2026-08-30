@@ -47,6 +47,11 @@ python3 workflow/bin/workflow_transition.py status
 指令一律加前綴 `python3 workflow/bin/workflow_transition.py`。
 每次 transition 之後，**先單獨提交 `workflow/STATE.md` 與 `workflow/state-log.md`**，再繼續下一階段的工作。
 
+**送審之前，被批准的內容必須先 commit** —— 注意是 `submit-for-review` **之前**，
+不是 `approve-spec` 之前。`PROJECT-PROFILE.md` 一進 SPEC_REVIEW 就變成唯讀的
+Control Plane，那時再想用一般 commit 修它就來不及了。`submit-for-review` 會替你
+檢查這件事（exit 37）。
+
 **批准之前，被批准的內容必須先 commit。** `approve-spec` 會檢查
 `PROJECT-PROFILE.md` 與 `openspec/changes/<change>/**`、`approve-tests` 會檢查
 `workflow/test-cases/<change>.md` —— 三者都必須存在於 HEAD，且 worktree / index /

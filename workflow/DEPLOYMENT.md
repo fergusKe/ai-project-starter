@@ -20,12 +20,25 @@
 
 ### 打包的最低要求
 
+**以下只在專案選擇 container deployment 時適用。** 不是所有部署都需要 Dockerfile
+（靜態站、函式即服務、平台原生 buildpack 都不需要），也不是所有服務都需要一份
+production compose 檔。Starter 不預設你的部署形態。
+
 1. **Multi-stage build**：build 階段裝套件、編譯；最終 image 只保留執行所需檔案。
-   基底用輕量 image（例如 `node:24-alpine`）。最終 image 不含編譯工具 ——
-   體積更小，攻擊面也更小。
-2. **`.dockerignore` 必須排除 `node_modules`、`.env`、`.git`**。
+   最終 image 不含編譯工具 —— 體積更小，攻擊面也更小。
+
+   基底 image 要**釘住不可變的識別**（digest 或至少完整版本 tag）。
+   `node:24-alpine` 這種 tag 會隨時間指向不同 image，重現性就沒了。
+   另外 Alpine 用 musl，含 native dependency 的專案不一定適用 ——
+   選 base image 是專案決策，不是預設值。
+2. **`.dockerignore` 必須排除 `node_modules`、`.env*`、`.git`**。
    這是上線前最容易踩的雷：把 `.env` 打包進 image，等於把金鑰發給每一個
    拿得到 image 的人。
+
+   但要清楚它的能力邊界：**排除 `.env` 只是最低限度的靜態檢查，不足以證明
+   秘密沒有進到 image。** build args 與 build 期間的環境變數同樣會留在
+   image layer 或 build history 裡。需要在 build 期間取用秘密時，
+   用 build secret mount，不要用 `ARG` / `ENV` 傳。
 3. **production compose 檔**（例如 `docker-compose-prod.yml`）：能完整啟動
    前端 + 後端 + 資料庫，**只有需要對外的服務開 port**。
 4. **先在本地 build 並跑起來驗證**。本地起不來，丟到雲端只會更難 debug。

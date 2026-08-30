@@ -25,15 +25,22 @@ shell 權限的 AI 不構成約束」。我們對自己的最後一道防線用�
 |---|---|---|---|
 | PreToolUse hook | `.claude/hooks/` | Claude Code 的即時誤動作 | Bash 直接繞過；其他 agent harness 不執行 |
 | pre-commit | 本機 `.githooks/` | 絕大多數日常錯誤，回饋最快 | `--no-verify`、`push` 到別的地方 |
-| **CI required check** | **GitHub runner** | **上述全部** | 有 admin 權限的人手動 override |
+| **CI required check** | **GitHub runner** | 它**實際檢查到**的 repository mutation | 已經發生的本機副作用；有 admin 權限的人手動 override |
 | CODEOWNERS + review | GitHub | 「機器覺得沒問題但人覺得有問題」 | 人類蓋章不看 |
 
-**注意第三層的位置。** CI runner 上沒有你的 worktree，也沒有你的 index，
-只有 push 上去的 HEAD。Starter 內部反覆處理的「worktree / index / HEAD 三者
-分裂」問題，在這一層是結構性不存在的 —— 因為那裡只有一個 HEAD。
+**注意第三層的位置。** CI runner 的 checkout 起始於受測 commit 的**乾淨
+materialization** —— worktree 與 index 都存在（`actions/checkout` 會建立），
+但它們一開始就與該 commit 一致，不存在開發機上那種「worktree 是 A、index 是 B」
+的三態分裂。
 
-這不代表本機的 HEAD 綁定可以不做（沒有 CI 的專案仍然只有本機），但它說明了
-**為什麼本機那一層永遠只能做到「盡量」，而伺服器端可以做到「一定」**。
+**但要說清楚 required check 做得到什麼、做不到什麼：**
+
+- 它能拒絕**它實際檢查到**的 repository mutation。GitHub ruleset 只保證指定的
+  check 必須成功；check 裡面檢查什麼，仍然完全由 workflow 決定。
+  一個什麼都不查的 required check，是一個比較慢的 lint。
+- 它**不能撤銷本機已經發生的副作用**。PreToolUse 要防的是「AI 在你的磁碟上做了
+  不該做的事」，那件事一旦發生，CI 只能拒絕它進入受保護分支。
+- 它**不是身份認證**。它證明的是內容與歷史的性質，不是誰做的。
 
 ## 設定步驟
 
@@ -129,7 +136,9 @@ git push --set-upstream origin test/merge-protection-check
 
 所以真正的人類授權是三件事疊起來的：
 
-1. `approve-spec` / `approve-tests` 的 **TTY 要求** —— 程式呼叫偽造不了
+1. `approve-spec` / `approve-tests` 的 **TTY 要求** —— 這是一道**已驗證的
+   非互動邊界**（`subprocess.run` 拿不到 controlling terminal），
+   不是不可偽造的人類身份認證
 2. **CODEOWNERS + required review** —— Control Plane 檔案的變更要人看過
 3. **required status check** —— 上面兩件事的紀錄要能被機器複驗
 

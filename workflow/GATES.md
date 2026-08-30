@@ -712,3 +712,43 @@ PASS 但沒跑」，需要 Playwright test id 與 journey id 對應、從 report
 但把產品變更留在 staged」，必須寫成 `git commit -m msg -- <paths>`；
 少了 pathspec，待驗的產品檔案會被一起 commit 掉，gate 沒東西可看，測試假綠。
 
+## Release acceptance：在採用者形狀上跑完整條生命週期（rc.5）
+
+`DEVELOPING.md` 說明本 repo 是 Starter **原始碼**，不是採用 Starter 的專案 ——
+它刻意不設 `core.hooksPath`，`STATE.md` 是出貨模板。所以**對 Starter 自己的歷史跑
+runtime audit 預期會失敗**，那不是缺陷；採用者只應從 sanctioned installation
+baseline 或 PR merge-base 起算。
+
+但這留下一個缺口：這條工作流從未在真實採用者形狀中被整體走完過。e2e 測試模擬過
+片段，那是模擬 —— bootstrap、真實的 git hook、TTY 批准、對整段合法歷史跑伺服器端
+稽核，這四件事只有在 `workflow/bin/acceptance.py` 裡才會同時發生。
+
+它涵蓋安裝 → TTY 批准 ×2 → 產品 commit → 驗證 → 封存 → 第二輪 → 伺服器稽核，
+並且**正反兩向**：合法歷史必須通過，`--no-verify` 繞過本機的未授權 commit 必須被擋。
+只有正向的話，那個綠燈證明不了任何事。
+
+### 它第一次跑就抓到的兩件事
+
+兩件都是「本機測試涵蓋不到、只有真的走一遍才會撞到」的類型。
+
+**1. submit-for-review 是內容必須進 HEAD 的最後時機。**
+`PROJECT-PROFILE.md` 在 DISCOVERY/SPECIFICATION 是 AI-writable，一進 SPEC_REVIEW
+就變成唯讀的 Control Plane。而 `approve-spec` 要求被批准的內容已在 HEAD。
+兩者相加：沒有在送審前 commit 的人會在 SPEC_REVIEW **卡死** —— approve-spec 說
+「內容不在 HEAD」，一般 commit 說「Control Plane 變更不可透過一般 commit」，
+兩則訊息都不指向真正的原因（順序錯了）。
+
+因此 `submit-for-review` 現在自己檢查這件事並給出可操作的指示（exit 37）。
+**失敗要發生在能修的地方**，不是在已經來不及的地方。
+
+**2. `Core verification policy: custom` 對 greenfield 是雞生蛋。**
+`verify.sh` 的 custom 分支**完全忽略 `plan_mode`** —— `auto` 有 pre-commit 與 full
+兩套計畫，custom 只有一條指令，在兩種模式下都跑。於是從 profile 宣告它那一刻起，
+每一個 commit（含 Control Plane transition）都要先讓它通過；而驗證腳本本身是產品
+程式碼，ENGINEERING 之前根本不能 commit。
+
+已知邊界，rc.5 不改行為，但採用者必須知道：**custom 指令要能在「還沒有任何產品
+程式碼」的 repo 上通過**，或者等到 ENGINEERING 之後再把 policy 改成 custom
+（那要走 SPECIFICATION 重新 review）。Brownfield 不受影響 —— 它的驗證入口本來就
+已經在 repo 裡。
+

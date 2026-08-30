@@ -328,7 +328,24 @@ def cmd_submit(a):
  if s.phase!='SPECIFICATION':die('submit-for-review 只允許 SPECIFICATION',35)
  if s.project_mode=='UNSET':die('Project mode 尚未設定；請先 set-mode',36)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
- ensure_review_artifacts(a.change);transition(s,replace(s,phase='SPEC_REVIEW',last_updated=now_iso()),'submit-for-review','machine-verified','Required OpenSpec artifacts exist')
+ ensure_review_artifacts(a.change)
+ # **這個邊界要求內容已經 commit，理由是離開它之後就來不及了。**
+ # PROJECT-PROFILE.md 在 DISCOVERY/SPECIFICATION 是 AI-writable，一進 SPEC_REVIEW
+ # 就變成 Control Plane（唯讀）。而 approve-spec 要求被批准的內容已在 HEAD 且
+ # worktree/index/HEAD 一致。兩者相加：沒有在這裡先 commit 的人，會在 SPEC_REVIEW
+ # 卡死 —— approve-spec 說「內容不在 HEAD」，而一般 commit 又說「Control Plane
+ # 變更不可透過一般 commit」，兩則訊息都不會告訴他真正的原因是順序錯了。
+ # 這是 release acceptance 第一次完整跑生命週期時撞到的。
+ for art in (PROFILE_ARTIFACT, spec_artifact(a.change)):
+  ok,why=artifact_binding_status(ROOT,art)
+  if not ok:
+   die('submit-for-review 之前，送審的內容必須先進入 Git 歷史：\n'+why
+       +'\n\n  請先提交，再送審：\n'
+       f'    git add PROJECT-PROFILE.md openspec/changes/{a.change}\n'
+       f'    git commit -m "spec: {a.change} 送審版本"\n\n'
+       '  為什麼是在這裡要求：PROJECT-PROFILE.md 進入 SPEC_REVIEW 之後就變成\n'
+       '  唯讀的 Control Plane，屆時只能用 control-plane-commit 或退回 SPECIFICATION。',37)
+ transition(s,replace(s,phase='SPEC_REVIEW',last_updated=now_iso()),'submit-for-review','machine-verified','Required OpenSpec artifacts exist')
 def cmd_approve_spec(a):
  s=parse_state(STATE)
  if s.phase!='SPEC_REVIEW':die('approve-spec 只允許 SPEC_REVIEW',40)

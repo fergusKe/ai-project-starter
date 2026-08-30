@@ -2408,6 +2408,8 @@ class RC5Round7SnapshotFidelityTests(unittest.TestCase):
         (d/'proposal.md').write_text('# Proposal\n做一件事。\n')
         (d/'tasks.md').write_text('# Tasks\n- [ ] 實作\n')
         (d/'specs/main.md').write_text('# Spec\n行為描述。\n')
+        # 送審前必須先把 profile 與 change 內容 commit 進 HEAD（exit 37）。
+        commit_approved_artifacts(r,change)
         for c in (['start-change',change],['submit-for-review',change]):
             subprocess.run(['python3','workflow/bin/workflow_transition.py']+c,
                            cwd=r,check=True,capture_output=True)
@@ -3063,6 +3065,7 @@ class RC5Round12Tests(unittest.TestCase):
             (d/'proposal.md').write_text('x',encoding='utf-8')
             (d/'tasks.md').write_text('x',encoding='utf-8')
             (d/'specs/main.md').write_text('x',encoding='utf-8')
+            commit_approved_artifacts(r,'demo')
             for c in (['start-change','demo'],['submit-for-review','demo']):
                 subprocess.run(['python3','workflow/bin/workflow_transition.py']+c,
                                cwd=r,check=True,capture_output=True)
@@ -4180,8 +4183,16 @@ class RC5Round16Tests(unittest.TestCase):
             (d/'tasks.md').write_text('# T\n- [ ] x\n',encoding='utf-8')
             (d/'specs/main.md').write_text('# S\n',encoding='utf-8')
             self.assertEqual(self._run(r,'start-change','demo').returncode,0)
+            # submit-for-review 現在會先擋「內容不在 HEAD」，所以要走到 approve-spec
+            # 自己那一層，必須用一條**送審之後**才讓內容離開 HEAD 的路徑。
+            # openspec/ 在 SPEC_REVIEW 仍是 AI-writable，所以刪掉再 commit 是可達的。
+            # 不重排兩層的順序：那會讓 approve-spec 那一層變成無法觸及而永遠測不到。
+            commit_approved_artifacts(r,'demo')
             self.assertEqual(self._run(r,'submit-for-review','demo').returncode,0)
-            # openspec 仍未 commit
+            shutil.rmtree(r/'openspec/changes/demo')
+            subprocess.run(['git','-C',str(r),'add','-A'],capture_output=True)
+            subprocess.run(['git','-C',str(r),'commit','--no-verify','-m','移除送審內容'],
+                           capture_output=True)
             x=self._run(r,'approve-spec','demo')
             out=x.stdout+x.stderr
             self.assertEqual(x.returncode,44,out)
@@ -4361,6 +4372,43 @@ class RC5Round17ServerAuditTests(unittest.TestCase):
                              cwd=r,capture_output=True,text=True)
             out=x.stdout+x.stderr
             self.assertNotEqual(x.returncode,0,'baseline 不得夾帶產品變更\n'+out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_submit_for_review_requires_content_in_head(self):
+        """**失敗要發生在能修的地方。**
+
+        PROJECT-PROFILE.md 在 DISCOVERY/SPECIFICATION 是 AI-writable，一進
+        SPEC_REVIEW 就變成唯讀的 Control Plane；而 approve-spec 要求內容已在 HEAD。
+        沒有在送審前 commit 的人會在 SPEC_REVIEW 卡死，而且兩則錯誤訊息
+        （「內容不在 HEAD」與「Control Plane 變更不可透過一般 commit」）
+        都不指向真正的原因。release acceptance 第一次跑就撞到這個。
+        """
+        td,r=self._repo()
+        try:
+            pf=r/'PROJECT-PROFILE.md'
+            pf.write_text(pf.read_text(encoding='utf-8')
+                          .replace('Type: UNKNOWN','Type: CLI')
+                          .replace('Web verification required: auto','Web verification required: no'),
+                          encoding='utf-8')
+            d=r/'openspec/changes/demo'; (d/'specs').mkdir(parents=True)
+            (d/'proposal.md').write_text('# P\n',encoding='utf-8')
+            (d/'tasks.md').write_text('# T\n- [ ] x\n',encoding='utf-8')
+            (d/'specs/main.md').write_text('# S\n',encoding='utf-8')
+            def cli(*a):
+                return subprocess.run(['python3','workflow/bin/workflow_transition.py',*a],
+                                      cwd=r,capture_output=True,text=True)
+            self.assertEqual(cli('set-mode','GREENFIELD').returncode,0)
+            self.assertEqual(cli('start-change','demo').returncode,0)
+            x=cli('submit-for-review','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,37,out)
+            self.assertIn('送審的內容必須先進入 Git 歷史',out,out)
+            self.assertIn('git add PROJECT-PROFILE.md',out,'訊息必須可操作\n'+out)
+            self.assertIn('Phase: SPECIFICATION',(r/'workflow/STATE.md').read_text(encoding='utf-8'),
+                          '被拒絕時不得已經 transition')
+            # commit 之後就過
+            commit_approved_artifacts(r,'demo')
+            self.assertEqual(cli('submit-for-review','demo').returncode,0)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_ai_writable_paths_still_pass(self):
