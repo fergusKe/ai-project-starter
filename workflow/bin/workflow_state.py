@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timezone
 import argparse, hashlib, json, os, re, shutil, stat, subprocess
 
@@ -20,6 +20,7 @@ INSTALLATION_PHASE='DISCOVERY'
 INSTALLATION_ALLOWED_ROOTS={'AGENTS.md','CLAUDE.md','CONTEXT.md','PROJECT-PROFILE.md','README.md','SETUP.md','START-HERE.md','.gitignore'}
 INSTALLATION_ALLOWED_PREFIXES=('.claude/','.githooks/','docs/','openspec/','prompts/','templates/','workflow/')
 BROWSER_EVIDENCE_RE=re.compile(r"^workflow/evidence/[^/]+/browser\.md$")
+EVIDENCE_CHANGE_RE=re.compile(r"^workflow/evidence/([^/]+)/")
 # Change identifier 的唯一合法形狀。這個名字會被當成 **path component** 使用
 # （`openspec/changes/<id>`、`workflow/evidence/<id>/…`），也會被寫進 STATE.md 與
 # append-only 的 state-log，所以它同時是路徑輸入與檔案格式輸入，兩邊都要守住。
@@ -1010,6 +1011,26 @@ def path_is_control_plane(rel:str,phase:str)->bool:
     if rel in CONTROL_PLANE_FILES or any(rel.startswith(p) for p in CONTROL_PLANE_PREFIXES): return True
     return rel in EARLY_MUTABLE_POLICY_FILES and phase not in {'DISCOVERY','SPECIFICATION'}
 
+def evidence_write_allowed(rel:str, state)->bool:
+    """這條 evidence 路徑在**目前狀態下**是否可寫。
+
+    為什麼不能用「目前 phase 是不是 ARCHIVE」代表歷史封存狀態：那是一個全域旗標，
+    而 evidence 是分 change 的。實測繞過 —— archive 完 change A 之後執行
+    `start-change B`，STATE 進入 SPECIFICATION，凍結條件 `phase=='ARCHIVE'` 不再成立，
+    於是 A 的 core/browser evidence 又可以被一般 commit 改掉；而 A 已經封存，
+    archive 不會再跑，沒有任何一條路徑會再去比對它。
+
+    正確的判準是**所有權**：只有目前 active change、且正處於實際產生 evidence 的
+    階段（ENGINEERING / VERIFICATION），才能寫自己的 evidence。其餘一律凍結 ——
+    包含歷史 change 的、以及尚未進入工程階段的本輪 change 的。
+    """
+    if not (CORE_EVIDENCE_RE.match(rel) or BROWSER_EVIDENCE_RE.match(rel)): return False
+    m = EVIDENCE_CHANGE_RE.match(rel)
+    if not m: return False
+    if m.group(1) != getattr(state,'active_change','none'): return False
+    return getattr(state,'phase','') in ('ENGINEERING','VERIFICATION')
+
+
 def path_is_ai_writable_non_product(rel:str,phase:str)->bool:
     if rel in AI_WRITABLE_ROOT or any(rel.startswith(p) for p in AI_WRITABLE_PREFIXES): return True
     if BROWSER_EVIDENCE_RE.match(rel): return True
@@ -1115,7 +1136,11 @@ def profile_resolution(root:Path):
         if why:
             invalid.append((name, v, why)); continue
         resolved[name] = v
-    if project_web_status(root)=='WEB' and not critical_journeys(root):
+    journeys, journey_errors = journeys_status(root)
+    # 格式錯誤對**所有**專案都要報。非 WEB 專案不必填 journeys，但既然填了，
+    # 一個寫壞的項目仍然代表使用者以為自己寫了某件事而系統沒收到。
+    invalid.extend(journey_errors)
+    if project_web_status(root)=='WEB' and not journeys:
         # 只對 WEB 專案要求。API/CLI 沒有 journey 可言，強制它們填等於製造假資料。
         unresolved.append('Critical user journeys（WEB 專案必須以 `- [J1] 描述` 的形式列出）')
     for name, default, allowed in PROFILE_POLICY_FIELDS:
@@ -1139,33 +1164,62 @@ def profile_resolution(root:Path):
     return unresolved, invalid, resolved, h.hexdigest()
 
 
-JOURNEY_RE=re.compile(r'^\s*[-*]\s*\[(J\d+)\]\s*(\S.*?)\s*$', re.M)
-JOURNEY_UNDEFINED={'尚未定義','TBD','UNKNOWN',''}
+JOURNEY_ITEM_RE=re.compile(r'^\s*[-*]\s*(.*?)\s*$')
+JOURNEY_ENTRY_RE=re.compile(r'^\[(J\d+)\]\s+(\S.*)$')
+JOURNEY_UNDEFINED={'尚未定義','TBD','UNKNOWN'}
 
 
-def critical_journeys(root:Path):
-    """`## Critical user journeys` 區段裡具**穩定 ID** 的項目，回傳 [(id, 文字)]。
+def journeys_status(root:Path):
+    """解析 `## Critical user journeys`，回傳 (journeys, errors)。
 
-    為什麼要 ID 而不是自由文字：browser evidence 必須能被機械核對「宣稱覆蓋了哪些
-    被批准的 journey」。沒有穩定 ID 的話，只能比對整段文字，而那會讓任何排版改動
-    都變成 gate 失敗。
+    為什麼要收集 errors 而不是靜默跳過不合格式的行：`- [J 2] 結帳與付款`（ID 裡多一個
+    空格）原本會被 `findall` 直接忽略。於是 J1 讓 profile 看起來「已定義」，人類以為
+    自己批准了兩條 journey，而 browser evidence 只寫 `J1: PASS` 就能通過。
+    **靜默忽略不合法的輸入，等於把打錯字變成關閉檢查** —— 跟 `Type: WEB_AP` 那個
+    typo 靜默關掉 Browser Gate 是同一個病，見 PROJECT-PROFILE.md〈打錯字不是未決〉。
+
+    重複 ID 同樣要擋：`- [J1] 結帳` 與 `- [J1] 付款` 並存時，單一行 `J1: PASS`
+    會同時滿足兩條，等於用一次驗證兌換兩條 journey 的覆蓋宣稱。
 
     能力邊界（必須明講）：這只能驗證**宣稱**，不能驗證那些 journey 真的被執行過。
     誠實執行仍是既有的能力邊界，見 GATES.md。
     """
     p = root/'PROJECT-PROFILE.md'
-    if not p.exists(): return []
+    if not p.exists(): return [], []
     # **先剝掉 HTML 註解。** 本檔在這個區段用註解放範例（`- [J1] 訪客可以…`），
     # 不剝的話那些範例會被當成真的 journey —— 一份全新的 profile 會憑空「已定義」
     # 兩個沒人寫過的 journey，而 WEB 專案的必填檢查也會被它們矇混過去。
     text = re.sub(r'<!--.*?-->', '', p.read_text(encoding='utf-8'), flags=re.S)
     m = re.search(r'^##\s*Critical user journeys\s*$(.*?)(?=^##\s|\Z)', text, re.M|re.S)
-    if not m: return []
-    out=[]
-    for jid, desc in JOURNEY_RE.findall(m.group(1)):
-        if desc.strip() in JOURNEY_UNDEFINED: continue
-        out.append((jid, desc.strip()))
-    return out
+    if not m: return [], []
+    out=[]; errors=[]; seen={}
+    for line in m.group(1).splitlines():
+        mi = JOURNEY_ITEM_RE.match(line)
+        if not mi: continue                      # 非列表行（空行、說明文字）不參與
+        body = mi.group(1)
+        if body in JOURNEY_UNDEFINED: continue   # 明示「尚未定義」是合法狀態
+        me = JOURNEY_ENTRY_RE.match(body)
+        if not me:
+            errors.append(('Critical user journeys', line.strip(),
+                           '不符 `- [J1] 描述` 格式。ID 必須是 `J` 加數字且不含空白，'
+                           '描述不得為空；不合法的項目不會被靜默忽略'))
+            continue
+        jid, desc = me.group(1), me.group(2).strip()
+        if jid in seen:
+            errors.append(('Critical user journeys', jid,
+                           f'ID 重複（{seen[jid]!r} 與 {desc!r}）。'
+                           'ID 必須唯一，否則一行 browser 結果會同時滿足多條 journey'))
+            continue
+        seen[jid] = desc
+        out.append((jid, desc))
+    return out, errors
+
+
+def critical_journeys(root:Path):
+    """合法的 journeys。**不合法的項目不會出現在這裡，也不會被當成不存在** ——
+    呼叫端若需要 fail-closed，必須改用 journeys_status 並檢查 errors。"""
+    j, _ = journeys_status(root)
+    return j
 
 
 def journeys_canonical(root:Path)->str:
@@ -1186,27 +1240,143 @@ def _normalize_progress(text:str)->str:
 
     反過來說，**任務與案例的文字**是被批准內容的一部分，不得改動。
     GATES.md 已經寫明勾選不是 gate 憑證；這裡是同一條規則的實作面。
+
+    **套用範圍必須明示**，見 `_is_progress_bearing_spec_file`：proposal / specs /
+    design 的勾選框是決策不是進度，逐字綁定。
     """
     return PROGRESS_LINE_RE.sub(r'\1 \2', text)
 
 
-def _tree_digest(root:Path, rel_paths):
-    """對一組檔案產生與路徑順序無關的 deterministic digest。
+def _is_progress_bearing_spec_file(rel:str)->bool:
+    """OpenSpec change 裡哪些檔案的勾選框算「進度」。
 
-    綁 worktree 內容而非 git object：被批准的是人類在 TTY 當下看到的那份文字，
-    而那份文字在磁碟上。缺檔與空檔必須可區分，否則刪掉檔案就等於通過。
+    只有 tasks 類檔案。proposal / specs / design 的勾選框是**決策**，不是進度 ——
+
+        ## 已批准範圍
+        - [ ] 啟用未驗證的公開付款 API
+
+    批准後把它改成 `- [x]`，在需求語意上是相反的決定，但若對整個 change 目錄一律
+    正規化，digest 完全不變。原本的實作就是這樣，等於把「未勾選＝不做」這個
+    最常見的規格寫法整類排除在批准綁定之外。
+    """
+    return PurePosixPath(rel).name.lower().startswith('task')
+
+
+CONTENT_SOURCES=('worktree','index','HEAD')
+
+
+def _git_out(root:Path, args, text=False):
+    r = subprocess.run(['git','-C',str(root)]+args, capture_output=True)
+    if r.returncode!=0: return None
+    return r.stdout.decode('utf-8','surrogateescape') if text else r.stdout
+
+
+def _source_paths(root:Path, source:str, prefix:str, is_dir:bool):
+    """該來源底下屬於 prefix 的檔案清單。取不到（非 git repo / 無 HEAD）回 None。
+
+    **路徑集合必須逐來源列舉**，不能拿 worktree 的清單去讀另外兩個來源 ——
+    否則 index 多出一個 worktree 沒有的檔案時，那個檔案不會進入 digest。
+    """
+    if source=='worktree':
+        if not is_dir:
+            return [prefix] if (root/prefix).is_file() else []
+        d = root/prefix
+        if not d.is_dir(): return []
+        return [q.relative_to(root).as_posix() for q in d.rglob('*') if q.is_file()]
+    args = (['ls-files','-z','--',prefix] if source=='index'
+            else ['ls-tree','-r','--name-only','-z','HEAD','--',prefix])
+    out = _git_out(root, args, text=True)
+    if out is None: return None
+    return [x for x in out.split('\0') if x]
+
+
+def _read_from(root:Path, source:str, rel:str):
+    if source=='worktree':
+        try: return (root/rel).read_bytes()
+        except OSError: return None
+    return _git_out(root, ['show', (':'+rel) if source=='index' else ('HEAD:'+rel)])
+
+
+def _digest_over(root:Path, source:str, rels, progress_bearing=None):
+    """對一組檔案產生與路徑順序無關的 deterministic digest。無法解碼時回 None。
+
+    缺檔與空檔必須可區分，否則刪掉檔案就等於通過。
+
+    `progress_bearing(rel)` 決定該檔是否套用勾選正規化；預設一律不套用（逐字綁定），
+    因為放寬必須是明示的選擇。
+
+    非 UTF-8 內容 fail-closed 回 None，不使用 `errors='replace'` ——
+    replace 會把不同的非法 byte sequence 摘要成同一段文字（全部變成 U+FFFD），
+    等於在 digest 上製造碰撞。
     """
     h = hashlib.sha256()
-    for rel in sorted(rel_paths):
+    for rel in sorted(rels):
         h.update(rel.encode()+b'\0')
-        q = root/rel
-        try:
-            raw = q.read_bytes()
-        except OSError:
+        raw = _read_from(root, source, rel)
+        if raw is None:
             h.update(b'<absent>\0'); continue
-        text = raw.decode('utf-8', errors='replace').replace('\r\n','\n')
-        h.update(hashlib.sha256(_normalize_progress(text).encode()).hexdigest().encode()+b'\0')
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+        text = text.replace('\r\n','\n')
+        if progress_bearing is not None and progress_bearing(rel):
+            text = _normalize_progress(text)
+        h.update(hashlib.sha256(text.encode()).hexdigest().encode()+b'\0')
     return h.hexdigest()
+
+
+def content_digest(root:Path, prefix:str, is_dir:bool, progress_bearing=None, source:str='worktree'):
+    rels = _source_paths(root, source, prefix, is_dir)
+    if rels is None: return None
+    if is_dir and not rels: return None
+    return _digest_over(root, source, rels, progress_bearing)
+
+
+def content_sources_agree(root:Path, label:str, prefix:str, is_dir:bool, progress_bearing=None):
+    """被批准的 artifact 在 worktree / index / HEAD 必須是同一份。回傳 (ok, reason)。
+
+    為什麼只綁 worktree 不夠 —— 這是 fresh-clone 不變式套用在**內容**上。
+    digest 只讀磁碟時，它證明的是「本機現在看到什麼」，不是「clone 之後會拿到什麼」。
+    兩個實測繞過：
+
+    1. **未追蹤的 artifact**：openspec/test-design/profile 建立但從未 commit，
+       approve 成功綁定 worktree digest，之後只依指示提交 STATE + state-log。
+       本機一路通過，fresh clone 卻拿到一份宣稱「已批准」但 artifact 根本不存在的 STATE。
+    2. **index / worktree 分裂**：批准 Spec A 之後把內容改成 B 並 `git add`，
+       再把 worktree 檔案還原成 A（保留 index 的 B），連同產品程式碼一起 commit。
+       Gate 對 spec 路徑走 AI-writable 豁免，而 digest 比對讀的是 worktree 的 A，
+       於是放行 —— 但 commit 與 fresh clone 拿到的是從未被批准的 B。
+
+    勾選進度仍然可以只存在於 worktree：三個來源比的是**正規化後**的內容。
+    """
+    got = {}
+    for src in CONTENT_SOURCES:
+        rels = _source_paths(root, src, prefix, is_dir)
+        if rels is None:
+            return False, (f'{label}：無法讀取 Git {src}。\n'
+                           '  批准內容必須綁定到 Git 歷史，因此這個 repository 必須已經初始化\n'
+                           '  並且至少有一個 commit。')
+        d = _digest_over(root, src, rels, progress_bearing)
+        if d is None:
+            return False, f'{label}：{src} 版本含非 UTF-8 內容，無法計算 digest。'
+        got[src] = (d, len(rels))
+    if got['HEAD'][1]==0:
+        return False, (f'{label}：這份內容不存在於 HEAD。\n'
+                       '  被批准的內容必須先進入 Git 歷史 —— 否則 STATE 會宣稱「已批准」，\n'
+                       '  而 fresh clone 拿不到任何被批准的東西。請先 commit 這些檔案。')
+    if len({v[0] for v in got.values()})!=1:
+        return False, (f'{label}：worktree / index / HEAD 三者內容不一致。\n'
+                       + ''.join(f'  {k:9s} digest {v[0][:16]}（{v[1]} 個檔案）\n' for k,v in got.items())
+                       + '  批准綁定的是會被 commit 出去的那一份。三者分裂時無法判斷\n'
+                       '  人類批准的到底是哪一份，因此 fail-closed。\n'
+                       '  （勾選進度不算差異；會觸發這條的是實際內容差異。）')
+    return True, ''
+
+
+def _tree_digest(root:Path, rel_paths, progress_bearing=None):
+    """相容介面：對明確給定的 worktree 路徑集合計算 digest。"""
+    return _digest_over(root, 'worktree', rel_paths, progress_bearing)
 
 
 def spec_digest(root:Path, change:str):
@@ -1219,7 +1389,7 @@ def spec_digest(root:Path, change:str):
         if q.is_file():
             rels.append(q.relative_to(root).as_posix())
     if not rels: return None
-    return _tree_digest(root, rels)
+    return _tree_digest(root, rels, _is_progress_bearing_spec_file)
 
 
 def test_design_digest(root:Path, change:str):
@@ -1227,7 +1397,30 @@ def test_design_digest(root:Path, change:str):
     if not change or change=='none' or validate_change_id(change): return None
     p = root/'workflow/test-cases'/f'{change}.md'
     if not p.is_file(): return None
-    return _tree_digest(root, [p.relative_to(root).as_posix()])
+    # test-case 檔整份都是案例清單，勾選狀態就是執行進度，因此全檔套用正規化。
+    return _tree_digest(root, [p.relative_to(root).as_posix()], lambda rel: True)
+
+
+PROFILE_ARTIFACT = ('PROJECT-PROFILE.md', 'PROJECT-PROFILE.md', False, None)
+
+
+def spec_artifact(change:str):
+    return (f'OpenSpec change `{change}`', f'openspec/changes/{change}', True,
+            _is_progress_bearing_spec_file)
+
+
+def test_design_artifact(change:str):
+    return (f'Test design `{change}`', f'workflow/test-cases/{change}.md', False,
+            lambda rel: True)
+
+
+def artifact_binding_status(root:Path, artifact):
+    """把 (label, prefix, is_dir, progress_bearing) 攤開丟給 content_sources_agree。
+
+    存在的意義是讓 approve 與 post-approval gate **用同一個描述子**。
+    兩邊各自寫一份參數，遲早會有一邊漏掉某個 artifact，而那種漏洞不會有任何症狀。
+    """
+    return content_sources_agree(root, *artifact)
 
 
 def approved_content_status(root:Path, state):
@@ -1250,6 +1443,8 @@ def approved_content_status(root:Path, state):
             return False, ('STATE 沒有記錄批准時的 OpenSpec change digest。\n'
                            '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的\n'
                            '  spec 就是人類批准過的那一份。請重新執行 approve-spec。')
+        ok, why = artifact_binding_status(root, spec_artifact(state.active_change))
+        if not ok: return False, why
         cur = spec_digest(root, state.active_change)
         if cur is None:
             return False, (f'找不到可計算 digest 的 OpenSpec change：{state.active_change}\n'
@@ -1264,6 +1459,8 @@ def approved_content_status(root:Path, state):
         if state.test_design_digest=='none':
             return False, ('STATE 沒有記錄批准時的 test design digest。\n'
                            '  請重新執行 approve-tests。')
+        ok, why = artifact_binding_status(root, test_design_artifact(state.active_change))
+        if not ok: return False, why
         cur = test_design_digest(root, state.active_change)
         if cur is None:
             return False, (f'找不到 test design artifact：'
@@ -1298,6 +1495,10 @@ def approved_profile_status(root:Path, state):
         return False, ('STATE 沒有記錄批准時的 PROJECT-PROFILE digest。\n'
                        '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的\n'
                        '  profile 就是人類批准過的那一份。請重新執行 approve-spec。')
+    # 先確認三個來源是同一份，再談 digest 是否相符。三者分裂時 digest 比對沒有意義：
+    # 它可能與 worktree 相符，而即將被 commit 出去的是 index 裡的另一份。
+    ok, why = artifact_binding_status(root, PROFILE_ARTIFACT)
+    if not ok: return False, why
     unresolved, invalid, _, current = profile_resolution(root)
     if unresolved or invalid:
         return False, ('PROJECT-PROFILE.md 目前無法產生 digest'

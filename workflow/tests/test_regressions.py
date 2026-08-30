@@ -74,6 +74,10 @@ def stamp_approved_profile(r):
             else:
                 s=s.replace('Last updated:',f'{key}: {val}\nLast updated:',1)
         st.write_text(s,encoding='utf-8')
+        # 被批准的內容必須已經在 HEAD，且三個來源一致。少了這一步，fixture 模擬的
+        # 是「STATE 宣稱已批准、但 fresh clone 拿不到被批准的東西」—— 真實的
+        # approve-spec 現在產生不出這種狀態。
+        commit_approved_artifacts(r, chg)
     finally:
         _sys.path.remove(str(r/'workflow/bin'))
     return dg
@@ -86,6 +90,61 @@ def fixture():
         if s.is_dir(): shutil.copytree(s,d,ignore=shutil.ignore_patterns("tests","__pycache__","*.pyc","node_modules","dist","build",".next","venv",".venv","coverage","playwright-report","test-results"))
         else: d.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(s,d)
     return td,r
+
+
+def ensure_git_repo(r):
+    """讓 fixture 成為真的 git repository（不建立 commit）。
+
+    被批准的內容要綁到 worktree/index/HEAD 三者，而 Starter 本來就要求 git
+    （bootstrap 會安裝 hook）。一個沒有 git 的 fixture 模擬的是真實安裝不會存在的
+    狀態 —— 它讓所有依賴 Git 歷史的判準退化成「取不到就跳過」，那是最糟的綠燈。
+
+    刻意不 commit：有些測試（例如 bootstrap 的 fail-closed）需要一個還沒有
+    baseline commit 的起點。"""
+    if not (r/'.git').exists():
+        subprocess.run(['git','-C',str(r),'init','-b','main'],capture_output=True)
+    for args in (['config','user.email','reg@example.invalid'],
+                 ['config','user.name','Reg'],['config','commit.gpgsign','false']):
+        subprocess.run(['git','-C',str(r)]+args,capture_output=True)
+
+
+def recommit(r, msg='fixture: bind content to HEAD'):
+    """把目前 worktree 送進 index 與 HEAD，讓三個來源一致。
+
+    「批准後內容被換掉」有兩種形狀，各自由不同的一層擋下：
+
+    - **只改 worktree**（不 stage）→ 三來源分裂，由 content_sources_agree 擋。
+    - **改完並 commit** → 三來源一致但與批准的 digest 不符，由 digest 比對擋。
+
+    兩層都必須有測試鎖住。只測前者的話，digest 那層可以被整個刪掉而測試全綠 ——
+    這正是 N3 與 Q7c 兩次踩到的坑（冗餘層的訊息沒被鎖住）。
+    """
+    subprocess.run(['git','-C',str(r),'add','-A'],capture_output=True)
+    subprocess.run(['git','-C',str(r),'-c','core.hooksPath=/dev/null','commit',
+                    '--no-verify','-m',msg],capture_output=True)
+
+
+def recommit_paths(r, *paths, msg='fixture: bind paths to HEAD'):
+    """只把指定路徑送進 HEAD。用在「掉包被批准內容、但產品程式碼要留在 staged」
+    的情境 —— `git add -A` 會把待驗的產品變更一起 commit 掉，gate 就沒東西可看了。"""
+    subprocess.run(['git','-C',str(r),'add','--',*paths],capture_output=True)
+    # `git commit` 不加 pathspec 會提交整個 index —— 連帶把待驗的產品變更也 commit 掉，
+    # gate 就沒有 staged 產品檔案可看，測試會假綠。
+    subprocess.run(['git','-C',str(r),'-c','core.hooksPath=/dev/null','commit',
+                    '--no-verify','-m',msg,'--',*paths],capture_output=True)
+
+
+def commit_approved_artifacts(r, chg, extra=()):
+    """把被批准的內容送進 HEAD，讓 worktree/index/HEAD 三者一致。"""
+    ensure_git_repo(r)
+    paths=['PROJECT-PROFILE.md',*extra]
+    if chg not in ('none','',None):
+        paths += [f'openspec/changes/{chg}', f'workflow/test-cases/{chg}.md']
+    have=[x for x in paths if (r/x).exists()]
+    if have:
+        subprocess.run(['git','-C',str(r),'add','--']+have,capture_output=True)
+    subprocess.run(['git','-C',str(r),'commit','--no-verify','-m','fixture: approved content'],
+                   capture_output=True)
 
 class HookDecisionTests(unittest.TestCase):
     def setUp(self):
@@ -1261,6 +1320,9 @@ class RC5HumanApprovalPromptTests(unittest.TestCase):
                       .replace('CI provider: UNKNOWN','CI provider: GitHub Actions')
                       .replace('Test database strategy: UNKNOWN','Test database strategy: not-applicable'),
                       encoding='utf-8')
+        # approve-spec 現在要求被批准的內容已經在 HEAD、且三個來源一致。
+        # 本組測的是 TTY 提示本身，所以 fixture 必須先滿足那個前提。
+        commit_approved_artifacts(r,'demo')
         return td,r
 
     def _run_on_pty(self, repo, keystrokes, timeout=20):
@@ -2353,6 +2415,7 @@ class RC5Round7SnapshotFidelityTests(unittest.TestCase):
             k=k.replace('_',' ')
             t=_re.sub(rf'^{_re.escape(k)}:[ \t]*.*$',f'{k}: {v}',t,count=1,flags=_re.M)
         p.write_text(t,encoding='utf-8')
+        recommit(r,'fixture: profile')
 
     def test_approve_spec_refuses_while_profile_is_unresolved(self):
         """G4 撞出的政策矛盾：UNKNOWN 可以進 SPEC_REVIEW，但不能進 ENGINEERING。
@@ -2672,6 +2735,8 @@ class RC5Round12Tests(unittest.TestCase):
                           Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                           CI_provider='GitHub Actions',
                           Test_database_strategy='not-applicable')
+        # 定案的 profile 必須進 HEAD：approve-spec 現在要求 worktree/index/HEAD 一致。
+        recommit(r,'fixture: resolved profile')
 
     # ---- Blocker 1：receipt 只能替 probe 之前捕獲的狀態背書 -------------------
 
@@ -2928,6 +2993,8 @@ class RC5Round12Tests(unittest.TestCase):
             # STATE 宣稱 test design 已批准，artifact 就必須存在。
             tc=r/'workflow/test-cases'; tc.mkdir(parents=True,exist_ok=True)
             (tc/'demo.md').write_text('# Test Design\n- [ ] 案例\n',encoding='utf-8')
+            # 且必須進 HEAD：宣稱已批准而 fresh clone 拿不到，就是不忠實的 fixture。
+            recommit(r,'fixture: approved artifacts')
             sys.path.insert(0,str(r/'workflow/bin'))
             try:
                 import importlib, workflow_state as W
@@ -2942,8 +3009,11 @@ class RC5Round12Tests(unittest.TestCase):
                 self.assertEqual(ok.returncode,0,'前提：未改動時應該通過\n'+ok.stdout+ok.stderr)
                 s=W.parse_state(r/'workflow/STATE.md')
                 W.write_state(r/'workflow/STATE.md',dataclasses_replace(s,phase='TEST_DESIGN'))
+                # 掉包並 commit：三來源一致，鎖的是 digest 層。只改 worktree 的形狀
+                # 由 RC5Round13Tests 的綁定層測試鎖住。
                 self._set_profile(r,Core_verification_policy='not-applicable',
                                   Verification_exception_reason='skip')
+                recommit(r,'swap policy')
                 x=self._run(r,'start-engineering','demo')
                 out=x.stdout+x.stderr
                 self.assertEqual(x.returncode,44,out)
@@ -3083,6 +3153,8 @@ class RC5Round12Tests(unittest.TestCase):
         try:
             self._set_profile(r,Core_verification_policy='not-applicable',
                               Verification_exception_reason='skip automated checks')
+            # 這是批准**之前**的合法設定，不是掉包：要進 HEAD 才能被批准。
+            recommit(r,'fixture: policy before approval')
             code,out=self._approve_on_pty(r)
             self.assertEqual(code,0,out)
             self.assertIn('Core verification policy: not-applicable',out,
@@ -3241,9 +3313,29 @@ class RC5Round13Tests(unittest.TestCase):
             x=self._run(r,'verification-pass','demo')
             out=x.stdout+x.stderr
             self.assertEqual(x.returncode,44,out)
-            self.assertIn('與人類批准的內容不一致',out,out)
+            # 掉包只發生在 worktree，所以先被三來源綁定層擋下（它的訊息更精確地
+            # 說出了發生什麼事）。digest 層的訊息由 test_committed_swap_is_caught_by_digest
+            # 鎖住 —— 兩層都要有測試，否則其中一層可被刪除而測試全綠。
+            self.assertIn('worktree / index / HEAD 三者內容不一致',out,out)
             self.assertFalse((r/'workflow/evidence/demo/core').exists(),
                              '連 evidence 都不該被產生 —— 檢查必須在跑 verify.sh 之前')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_committed_swap_is_caught_by_digest(self):
+        """**綁定層的姊妹測試。** 掉包後 commit，三來源一致 —— 綁定層無話可說，
+        必須由 digest 比對擋下。少了這一條，digest 那層可以被整個刪掉而測試全綠。"""
+        td,r=self._repo()
+        try:
+            self._approved_engineering(r)
+            self._set_profile(r,Core_verification_policy='not-applicable',
+                              Verification_exception_reason='temporarily skip')
+            recommit(r,'swap policy and commit')
+            x=self._run(r,'verification-pass','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,44,out)
+            self.assertIn('與人類批准的內容不一致',out,out)
+            self.assertNotIn('三者內容不一致',out,
+                             '三來源已一致，不該再宣稱分裂\n'+out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_archive_also_rebinds(self):
@@ -3253,8 +3345,10 @@ class RC5Round13Tests(unittest.TestCase):
             self._approved_engineering(r)
             ok=self._run(r,'verification-pass','demo')
             self.assertEqual(ok.returncode,0,'前提：誠實路徑通過\n'+ok.stdout+ok.stderr)
+            # commit 掉包內容：三來源一致，鎖的是 digest 層而非綁定層。
             self._set_profile(r,Core_verification_policy='not-applicable',
                               Verification_exception_reason='temporarily skip')
+            recommit(r,'swap policy')
             x=self._run(r,'archive','demo')
             out=x.stdout+x.stderr
             self.assertEqual(x.returncode,44,out)
@@ -3348,9 +3442,13 @@ class RC5Round13Tests(unittest.TestCase):
             x=run_guard()
             self.assertNotIn('"permissionDecision": "deny"',x.stdout,
                              '前提：批准狀態一致時應該放行\n'+x.stdout+x.stderr)
-            # profile 被換成人類沒批准過的內容 → 必須跟著拒絕
+            # profile 被換成人類沒批准過的內容 → 必須跟著拒絕。
+            # 這裡刻意 **commit** 掉包內容：三來源一致，因此被 digest 層擋，
+            # 鎖的是 digest 層的訊息。只在 worktree 掉包的形狀由
+            # test_worktree_only_swap_is_caught_by_the_binding_layer 鎖住。
             self._set_profile(r,Core_verification_policy='not-applicable',
                               Verification_exception_reason='temporarily skip')
+            recommit(r,'swap policy')
             y=run_guard()
             self.assertIn('deny',y.stdout,'profile 已被換掉，guard 必須拒絕\n'+y.stdout+y.stderr)
             self.assertIn('與人類批准的內容不一致',y.stdout,y.stdout)
@@ -3484,8 +3582,11 @@ class RC5Round15Tests(unittest.TestCase):
             subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
             ok=self._gate(r)
             self.assertEqual(ok.returncode,0,'前提：未改動時產品 commit 應放行\n'+ok.stdout+ok.stderr)
+            # 掉包並 commit：三來源一致，因此由 digest 層擋下。
+            # 只改 worktree 的形狀由 test_uncommitted_spec_swap_is_caught_too 鎖住。
             (r/'openspec/changes/demo/proposal.md').write_text(
                 '# Spec B\n直接對外開放付款 API，不做驗證。\n',encoding='utf-8')
+            recommit_paths(r,'openspec/changes/demo',msg='swap spec')
             x=self._gate(r)
             out=x.stdout+x.stderr
             self.assertNotEqual(x.returncode,0,out)
@@ -3500,10 +3601,28 @@ class RC5Round15Tests(unittest.TestCase):
             subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
             (r/'workflow/test-cases/demo.md').write_text('# Test Design B\n- [ ] 不用測\n',
                                                          encoding='utf-8')
+            recommit_paths(r,'workflow/test-cases/demo.md',msg='swap test design')
             x=self._gate(r)
             out=x.stdout+x.stderr
             self.assertNotEqual(x.returncode,0,out)
             self.assertIn('Test design 的內容與人類批准的不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_uncommitted_spec_swap_is_caught_too(self):
+        """**綁定層。** 掉包只發生在 worktree（或只 stage 進 index）時，digest 比對
+        讀 worktree 可能仍然相符，但 commit 出去的是另一份。fresh-clone 不變式
+        套用在內容上：批准綁的是會被 commit 出去的那一份。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            (r/'openspec/changes/demo/proposal.md').write_text(
+                '# Spec B\n直接對外開放付款 API。\n',encoding='utf-8')
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('三者內容不一致',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_progress_checkboxes_do_not_invalidate_approval(self):
@@ -3558,6 +3677,9 @@ class RC5Round15Tests(unittest.TestCase):
             p=r/'workflow/STATE.md'
             p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
                                 p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            # ARCHIVE transition 必須已進入 Git 歷史才能開下一輪：清掉 STATE 上一輪的
+            # digest 之前，那份 STATE 必須先被保存下來。
+            recommit(r,'archive first-change')
             nxt=r/'openspec/changes/second-change'; nxt.mkdir(parents=True)
             (nxt/'proposal.md').write_text('x',encoding='utf-8')
             x=self._run(r,'start-change','second-change')
@@ -3581,6 +3703,7 @@ class RC5Round15Tests(unittest.TestCase):
             p=r/'workflow/STATE.md'
             p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
                                 p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            recommit(r,'archive demo')
             x=self._run(r,'start-change','demo')
             out=x.stdout+x.stderr
             self.assertEqual(x.returncode,34,out)
@@ -3607,7 +3730,7 @@ class RC5Round15Tests(unittest.TestCase):
             x=self._gate(r)
             out=x.stdout+x.stderr
             self.assertNotEqual(x.returncode,0,out)
-            self.assertIn('不得修改已封存的 evidence',out,out)
+            self.assertIn('不得修改不屬於目前工作範圍的 evidence',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
     def test_evidence_is_writable_before_archive(self):
@@ -3731,6 +3854,333 @@ class RC5Round15Tests(unittest.TestCase):
                 self.assertEqual(cm.exception.code,49)
             finally:
                 sys.path.remove(str(r/'workflow/bin')); sys.modules.pop('wt_j',None)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
+class RC5Round16Tests(unittest.TestCase):
+    """Codex 第十六輪：四個 blocker 的修正各自的鎖。
+
+    共同主題：**上一輪的修正都停在「能擋住我想到的那一種形狀」**，而每一條的
+    真正判準都比那一種形狀更寬 —— 正規化的套用範圍、schema 的合法性、
+    凍結的所有權、綁定的來源。
+    """
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5r16-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _run(self,r,*args):
+        return subprocess.run(['python3','workflow/bin/workflow_transition.py',*args],
+                              cwd=r,capture_output=True,text=True)
+
+    def _gate(self,r):
+        return subprocess.run(['python3','workflow/bin/check-implementation-gate.py','--staged'],
+                              cwd=r,capture_output=True,text=True)
+
+    def _set_profile(self,r,**kv):
+        p=r/'PROJECT-PROFILE.md'; t=p.read_text(encoding='utf-8')
+        for k,v in kv.items():
+            k=k.replace('_',' ')
+            t=re.sub(rf'^{re.escape(k)}:[ \t]*.*$',f'{k}: {v}',t,count=1,flags=re.M)
+        p.write_text(t,encoding='utf-8')
+
+    def _engineering(self,r,change='demo',web=False):
+        self._set_profile(r,Type='WEB_APP' if web else 'API',
+                          Web_verification_required='yes' if web else 'no',
+                          Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
+                          CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+        if web:
+            pp=r/'PROJECT-PROFILE.md'
+            pp.write_text(pp.read_text(encoding='utf-8').replace(
+                '## Critical user journeys\n- 尚未定義',
+                '## Critical user journeys\n- [J1] 結帳\n- [J2] 付款'),encoding='utf-8')
+        d=r/'openspec/changes'/change; d.mkdir(parents=True,exist_ok=True)
+        (d/'proposal.md').write_text('# Spec A\n## 已批准範圍\n- [ ] 啟用未驗證的公開付款 API\n',
+                                     encoding='utf-8')
+        (d/'tasks.md').write_text('# Tasks\n- [ ] 實作 X\n',encoding='utf-8')
+        tc=r/'workflow/test-cases'; tc.mkdir(parents=True,exist_ok=True)
+        (tc/f'{change}.md').write_text('# Test Design A\n- [ ] 驗證 X\n',encoding='utf-8')
+        (r/'package.json').write_text(json.dumps({"scripts":{"test":"echo ok","build":"echo b"}}),
+                                      encoding='utf-8')
+        sys.path.insert(0,str(r/'workflow/bin'))
+        try:
+            import workflow_state as W
+            importlib.reload(W)
+            _,_,_,dg=W.profile_resolution(r)
+            self.assertIsNotNone(dg,'前提：profile 必須完全解析')
+            W.write_state(r/'workflow/STATE.md',
+                          W.WorkflowState('ENGINEERING','GREENFIELD',change,'yes','yes','no',
+                                          'human',W.now_iso(),dg,
+                                          W.spec_digest(r,change) or 'none',
+                                          W.test_design_digest(r,change) or 'none'))
+        finally: sys.path.remove(str(r/'workflow/bin'))
+        recommit(r,'approved')
+
+    # ---- Blocker 3：正規化的套用範圍 -----------------------------------------
+
+    def test_proposal_checkbox_is_a_decision_not_progress(self):
+        """**這是勾選正規化真正的邊界。**
+
+        `tasks.md` 的 `[x]` 是進度，正規化掉是對的。但同一段程式原本對整個
+        change 目錄一律正規化，於是 proposal / spec 裡最常見的規格寫法 ——
+
+            ## 已批准範圍
+            - [ ] 啟用未驗證的公開付款 API
+
+        —— 被勾成 `[x]` 之後 digest 完全不變。那是**相反的決定**，不是進度。
+        """
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            ok=self._gate(r)
+            self.assertEqual(ok.returncode,0,'前提：未改動時應放行\n'+ok.stdout+ok.stderr)
+            (r/'openspec/changes/demo/proposal.md').write_text(
+                '# Spec A\n## 已批准範圍\n- [x] 啟用未驗證的公開付款 API\n',encoding='utf-8')
+            recommit_paths(r,'openspec/changes/demo',msg='tick a decision box')
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                'proposal 的勾選是決策，不是進度；改了必須撤銷批准\n'+out)
+            self.assertIn('與人類批准的不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_tasks_checkbox_is_still_progress(self):
+        """對照組。範圍收窄不得把 tasks 的進度也一起收進去 ——
+        那會讓每打一個勾就撤銷一次批准，使用者只會學會繞過 gate。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            (r/'openspec/changes/demo/tasks.md').write_text('# Tasks\n- [x] 實作 X\n',
+                                                            encoding='utf-8')
+            recommit_paths(r,'openspec/changes/demo',msg='tick progress')
+            x=self._gate(r)
+            self.assertEqual(x.returncode,0,'tasks 打勾是進度，不得撤銷批准\n'+x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_invalid_utf8_fails_closed(self):
+        """`errors='replace'` 會把不同的非法 byte sequence 摘要成同一段文字
+        （全部變成 U+FFFD），等於在 digest 上製造碰撞。必須 fail-closed。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                before=W.spec_digest(r,'demo')
+                self.assertIsNotNone(before)
+                (r/'openspec/changes/demo/proposal.md').write_bytes(b'# Spec\n\xff\xfe binary\n')
+                self.assertIsNone(W.spec_digest(r,'demo'),
+                                  '非 UTF-8 內容必須讓 digest 無法計算，而不是被 replace 成別的字')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 4：journey schema -------------------------------------------
+
+    def test_malformed_journey_is_not_silently_ignored(self):
+        """`- [J 2] 結帳`（ID 裡多一個空格）原本會被 findall 直接忽略。
+        於是 J1 讓 profile 看起來「已定義」，人類以為自己批准了兩條 journey，
+        而 browser evidence 只寫 J1 就能通過。**靜默忽略等於把打錯字變成關閉檢查。**"""
+        td,r=self._repo()
+        try:
+            pp=r/'PROJECT-PROFILE.md'
+            pp.write_text(pp.read_text(encoding='utf-8').replace(
+                '## Critical user journeys\n- 尚未定義',
+                '## Critical user journeys\n- [J1] 結帳\n- [J 2] 付款'),encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                journeys,errors=W.journeys_status(r)
+                self.assertTrue(errors,'不合格式的項目必須被回報，不得靜默跳過')
+                _,invalid,_,dg=W.profile_resolution(r)
+                self.assertTrue(invalid,'不合法的 journey 必須讓 profile 無法解析')
+                self.assertIsNone(dg,'有非法值時不得產生 digest')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_duplicate_journey_id_is_rejected(self):
+        """`- [J1] 結帳` 與 `- [J1] 付款` 並存時，單一行 `J1: PASS`
+        會同時滿足兩條 —— 一次驗證兌換兩條 journey 的覆蓋宣稱。"""
+        td,r=self._repo()
+        try:
+            pp=r/'PROJECT-PROFILE.md'
+            pp.write_text(pp.read_text(encoding='utf-8').replace(
+                '## Critical user journeys\n- 尚未定義',
+                '## Critical user journeys\n- [J1] 結帳\n- [J1] 付款'),encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                _,errors=W.journeys_status(r)
+                self.assertTrue(any('重複' in why for _,_,why in errors),
+                                f'重複 ID 必須被擋：{errors}')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_contradictory_browser_results_are_rejected(self):
+        """`J1: PASS` 與 `J1: FAIL` 並存時，`re.search` 只看到第一筆而放行。
+        矛盾的結果不是「其中一筆有效」，是這份 evidence 不可信。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r,web=True)
+            ed=r/'workflow/evidence/demo'; (ed/'core').mkdir(parents=True,exist_ok=True)
+            (ed/'browser.md').write_text(
+                '# Browser Verification Evidence\nCore evidence: x.md\n'
+                'Playwright report: playwright-report/index.html\n'
+                'Chrome DevTools MCP: checked\nJ1: PASS\nJ1: FAIL\nJ2: PASS\n',encoding='utf-8')
+            # **隔離型測試。** 走 verification-pass 會先卡在 verify.sh（這個 fixture
+            # 沒有 Playwright），那樣測到的是別的東西。直接呼叫驗證器本身 ——
+            # 否則這一層可以被整個刪掉而測試照樣綠（Q7c 的教訓）。
+            import contextlib, io
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W, workflow_transition as T
+                importlib.reload(W); importlib.reload(T)
+                err=io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    T.validate_browser('demo')
+                self.assertEqual(cm.exception.code,49,err.getvalue())
+                self.assertIn('多筆結果',err.getvalue(),err.getvalue())
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 2：evidence 凍結的判準是所有權 -------------------------------
+
+    def test_previous_change_evidence_stays_frozen_in_the_next_round(self):
+        """**第一版修法只擋住一種形狀。** 用 `phase=='ARCHIVE'` 當凍結條件，
+        只要執行 `start-change B`，phase 離開 ARCHIVE，change A 的已封存 evidence
+        立刻又可寫 —— 而 A 不會再被任何 archive 或 verification 比對。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r,'first-change')
+            ev=r/'workflow/evidence/first-change/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# ev\n',encoding='utf-8')
+            recommit(r,'evidence')
+            p=r/'workflow/STATE.md'
+            p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
+                                p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            recommit(r,'archive')
+            nxt=r/'openspec/changes/second-change'; nxt.mkdir(parents=True)
+            (nxt/'proposal.md').write_text('x',encoding='utf-8')
+            ok=self._run(r,'start-change','second-change')
+            self.assertEqual(ok.returncode,0,'前提：ARCHIVE 是合法起點\n'+ok.stdout+ok.stderr)
+            # 現在 phase=SPECIFICATION，舊的凍結條件不成立
+            (ev/'20260101T000000Z.md').write_text('# tampered\n',encoding='utf-8')
+            subprocess.run(['git','add','workflow/evidence'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                '上一輪的封存證據在新一輪開始後仍必須凍結\n'+out)
+            self.assertIn('不屬於目前工作範圍',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_other_change_evidence_frozen_even_while_engineering(self):
+        """**隔離所有權那一半。**
+
+        上一條測試裡新一輪停在 SPECIFICATION，光靠 phase 檢查就擋住了 ——
+        突變證實：把 change 比對整段刪掉，那條測試照樣綠。真正需要所有權判準的
+        形狀是「新一輪已經進到 ENGINEERING（phase 檢查放行），卻去改上一輪的證據」。
+        """
+        td,r=self._repo()
+        try:
+            self._engineering(r,'first-change')
+            ev=r/'workflow/evidence/first-change/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# ev\n',encoding='utf-8')
+            recommit(r,'evidence for first-change')
+            # 直接做出「second-change 正在 ENGINEERING」的狀態
+            self._engineering(r,'second-change')
+            s=(r/'workflow/STATE.md').read_text(encoding='utf-8')
+            self.assertIn('Phase: ENGINEERING',s,s)
+            self.assertIn('Active OpenSpec change: second-change',s,s)
+            (ev/'20260101T000000Z.md').write_text('# tampered\n',encoding='utf-8')
+            subprocess.run(['git','add','workflow/evidence'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                'phase 允許寫 evidence，但只能寫**自己這一輪**的\n'+out)
+            self.assertIn('不屬於目前工作範圍',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_own_change_evidence_is_writable_while_engineering(self):
+        """對照組：所有權判準不得順手把合法的寫入也擋掉。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r,'demo')
+            ev=r/'workflow/evidence/demo/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# ev\n',encoding='utf-8')
+            subprocess.run(['git','add','workflow/evidence'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            self.assertEqual(x.returncode,0,
+                             'ENGINEERING 中的 active change 必須能寫自己的 evidence\n'
+                             +x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_start_change_refuses_when_archive_is_not_in_head(self):
+        """**反向測試。**
+
+        上一條是正向的（fixture 有 commit，所以有沒有這個要求都會過）——
+        突變證實：把要求整條刪掉，那條測試照樣綠。真正要鎖的是：ARCHIVE 尚未進入
+        Git 歷史時必須拒絕，否則 `archive A → start-change B` 中間不 commit，
+        那份唯一記載 A 完整 digest 的 STATE 會被覆寫，從未進入任何 commit。
+        """
+        td,r=self._repo()
+        try:
+            self._engineering(r,'first-change')
+            p=r/'workflow/STATE.md'
+            p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
+                                p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            # 刻意**不** commit
+            nxt=r/'openspec/changes/second-change'; nxt.mkdir(parents=True)
+            (nxt/'proposal.md').write_text('x',encoding='utf-8')
+            x=self._run(r,'start-change','second-change')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,34,out)
+            self.assertIn('尚未進入 Git 歷史',out,out)
+            self.assertIn('Phase: ARCHIVE',p.read_text(encoding='utf-8'),
+                          '被拒絕時不得已經改寫 STATE')
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 1：批准之前內容就要在 HEAD -----------------------------------
+
+    def test_approve_refuses_untracked_artifacts(self):
+        """artifact 從未 commit 時，批准會成功綁定 worktree digest，
+        之後只提交 STATE + state-log —— fresh clone 拿到一份宣稱「已批准」、
+        而被批准的東西根本不存在的 STATE。"""
+        td,r=self._repo()
+        try:
+            self._set_profile(r,Type='API',Web_verification_required='no',
+                              Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
+                              CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+            recommit(r,'baseline')
+            self.assertEqual(self._run(r,'set-mode','GREENFIELD').returncode,0)
+            d=r/'openspec/changes/demo'; (d/'specs').mkdir(parents=True)
+            (d/'proposal.md').write_text('# P\n',encoding='utf-8')
+            (d/'tasks.md').write_text('# T\n- [ ] x\n',encoding='utf-8')
+            (d/'specs/main.md').write_text('# S\n',encoding='utf-8')
+            self.assertEqual(self._run(r,'start-change','demo').returncode,0)
+            self.assertEqual(self._run(r,'submit-for-review','demo').returncode,0)
+            # openspec 仍未 commit
+            x=self._run(r,'approve-spec','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,44,out)
+            self.assertIn('不存在於 HEAD',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
 

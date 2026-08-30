@@ -9,11 +9,18 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  repository_enforcement,enforcement_is_active,GATE_BRIDGE_COMMAND,verification_policy,
  probe_enforcement,probe_head_enforcement,effective_pre_commit_hook,
  probe_fingerprint,finalize_probe_receipt,approved_profile_status,approved_content_status,
- spec_digest,test_design_digest,critical_journeys,
+ spec_digest,test_design_digest,critical_journeys,journeys_status,parse_state_text,
+ artifact_binding_status,PROFILE_ARTIFACT,spec_artifact,test_design_artifact,
  ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance,validate_change_id)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
 def die(msg,code):sys.stdout.flush();print(f'ERROR: {msg}',file=sys.stderr);raise SystemExit(code)
+def _head_state():
+ """HEAD 版本的 STATE。取不到（無 commit、無此檔、內容壞掉）時回 None。"""
+ r=subprocess.run(['git','-C',str(ROOT),'show','HEAD:workflow/STATE.md'],capture_output=True,text=True)
+ if r.returncode!=0:return None
+ try:return parse_state_text(r.stdout)
+ except ValueError:return None
 def git_sha():
  r=subprocess.run(['git','-C',str(ROOT),'rev-parse','HEAD'],capture_output=True,text=True);return r.stdout.strip() if r.returncode==0 else 'NO_HEAD'
 def append_log(action,actor,old_phase,new_phase,change,reason,extra=None):
@@ -221,13 +228,22 @@ def validate_browser(change):
  # 不證明它**覆蓋了被批准的範圍** —— 少了這一條，一份只驗首頁的 evidence
  # 可以替一個批准了「結帳、付款」的 profile 收尾。
  # 能力邊界：這驗證的是**宣稱**，不是那些 journey 真的被執行過。
- journeys=critical_journeys(ROOT)
+ journeys,journey_errors=journeys_status(ROOT)
+ if journey_errors:
+  die('PROJECT-PROFILE 的 critical user journeys 有不合法的項目，無法判定驗證範圍：\n  - '
+      +'\n  - '.join(f'{v}：{why}' for _,v,why in journey_errors),49)
  if not journeys:die('WEB 專案必須在 PROJECT-PROFILE 以 `- [J1] 描述` 列出 critical user journeys',49)
- missing=[];failed=[]
+ missing=[];failed=[];dup=[]
  for jid,desc in journeys:
-  m=re.search(rf'^{re.escape(jid)}:[ \t]*(\S+)',t,re.M)
-  if not m:missing.append(f'{jid}（{desc}）');continue
-  if m.group(1).upper()!='PASS':failed.append(f'{jid}: {m.group(1)}')
+  # findall 而非 search：`J1: PASS` 與 `J1: FAIL` 並存時，search 只看到第一筆而放行。
+  # 矛盾的結果不是「其中一筆有效」，是這份 evidence 不可信。
+  ms=re.findall(rf'^{re.escape(jid)}:[ \t]*(\S+)',t,re.M)
+  if not ms:missing.append(f'{jid}（{desc}）');continue
+  if len(ms)>1:dup.append(f'{jid}: {"、".join(ms)}（{len(ms)} 筆）');continue
+  if ms[0].upper()!='PASS':failed.append(f'{jid}: {ms[0]}')
+ if dup:
+  die('同一個 critical journey 有多筆結果，evidence 不可信：\n  - '+'\n  - '.join(dup)
+      +'\n每個 journey ID 必須恰好一行結果。',49)
  if missing:
   die('browser evidence 沒有涵蓋下列已批准的 critical journey：\n  - '+'\n  - '.join(missing)
       +'\n每個 journey 需要一行 `J<n>: PASS`。',49)
@@ -285,6 +301,16 @@ def cmd_start_change(a):
  if s.phase not in {'DISCOVERY','SPECIFICATION','ARCHIVE'}:
   die('start-change 只允許 DISCOVERY/SPECIFICATION/ARCHIVE',34)
  ensure_change_exists(a.change)
+ if s.phase=='ARCHIVE':
+  # 上一輪的完整狀態（三個 digest 與 evidence 記錄）必須已經進入 Git 歷史，才能把它
+  # 從 STATE 清掉。否則連續執行 `archive A → start-change B` 而中間不 commit，那份
+  # 唯一記載 A 完整 digest 的 STATE 會被直接覆寫，從未進入任何 commit —— 之後沒有
+  # 任何 fresh clone 或 CI audit 能重建 A 被批准的內容是什麼。
+  hs=_head_state()
+  if hs is None or hs.phase!='ARCHIVE' or hs.active_change!=s.active_change:
+   die('ARCHIVE transition 尚未進入 Git 歷史，不能開始新的一輪。\n'
+       '  請先單獨提交 workflow/STATE.md 與 workflow/state-log.md，再執行 start-change。\n'
+       '  理由：清掉 STATE 上一輪的 digest 之前，那份 STATE 必須已經被保存下來。',34)
  if s.phase=='ARCHIVE' and a.change==s.active_change:
   # 沿用同一個 change 名會讓新一輪的 evidence 寫進已封存那一輪的目錄，
   # 而 state-log 的兩筆 verification-pass 記錄會指向同一條路徑。
@@ -323,6 +349,12 @@ def cmd_approve_spec(a):
   die('PROJECT-PROFILE.md 有無法辨識的值：\n'
       +''.join(f'  - {n}: {v!r} —— {why}\n' for n,v,why in invalid)
       +'打錯字不會被當成未決，會被當成已決定 —— 而錯的值可能靜默關掉某個 Gate。',44)
+ # 批准之前，被批准的東西必須已經在 Git 歷史裡，而且 worktree/index/HEAD 是同一份。
+ # 只綁 worktree 的話，批准的是「本機現在看到什麼」，不是「clone 之後會拿到什麼」。
+ # 在 TTY 之前檢查：fail fast，而且這條規則因此在沒有 TTY 的環境下也測得到。
+ for art in (PROFILE_ARTIFACT, spec_artifact(a.change)):
+  ok,why=artifact_binding_status(ROOT,art)
+  if not ok:die('approve-spec 之前，被批准的內容必須已經進入 Git 歷史：\n'+why,44)
  sdg=spec_digest(ROOT,a.change)
  if sdg is None:die(f'無法計算 OpenSpec change 的 digest：openspec/changes/{a.change}',44)
  details=('即將定案的 PROJECT-PROFILE：\n'
@@ -340,6 +372,11 @@ def cmd_approve_spec(a):
  if spec_digest(ROOT,a.change)!=sdg:
   die('OpenSpec change 的內容在你確認期間被修改，批准作廢。\n'
       '  你看到並批准的是修改前的內容；請重新檢視後再執行一次 approve-spec。',44)
+ # 三來源綁定也要重驗。digest 讀 worktree，所以「等待期間把改動 stage 進 index」
+ # 不會讓上面兩條失敗 —— 但 commit 出去的會是 index 那一份。
+ for art in (PROFILE_ARTIFACT, spec_artifact(a.change)):
+  ok,why=artifact_binding_status(ROOT,art)
+  if not ok:die('批准作廢：確認期間 worktree/index/HEAD 的一致性被破壞。\n'+why,44)
  transition(s,replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by=actor,
                       profile_digest=digest,spec_digest=sdg,last_updated=now_iso()),
             'approve-spec',actor,
@@ -351,6 +388,8 @@ def cmd_approve_tests(a):
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
  ok,why=approved_content_status(ROOT,s)
  if not ok:die(f'approve-tests 需要已批准的內容仍然一致。\n{why}',44)
+ ok,why=artifact_binding_status(ROOT,test_design_artifact(a.change))
+ if not ok:die('approve-tests 之前，test design 必須已經進入 Git 歷史：\n'+why,44)
  tdg=test_design_digest(ROOT,a.change)
  if tdg is None:die(f'找不到 test design artifact：workflow/test-cases/{a.change}.md',44)
  details=(f'即將批准的 test design digest: {tdg[:16]}\n'
@@ -359,6 +398,8 @@ def cmd_approve_tests(a):
  actor=tty_human_confirm('approve-tests',a.change,details)
  if test_design_digest(ROOT,a.change)!=tdg:
   die('Test design 在你確認期間被修改，批准作廢；請重新檢視後再執行一次 approve-tests。',44)
+ ok,why=artifact_binding_status(ROOT,test_design_artifact(a.change))
+ if not ok:die('批准作廢：確認期間 worktree/index/HEAD 的一致性被破壞。\n'+why,44)
  transition(s,replace(s,test_design_approved='yes',approved_by=actor,
                       test_design_digest=tdg,last_updated=now_iso()),
             'approve-tests',actor,f'Human approved test design; digest {tdg[:16]}')

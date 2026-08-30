@@ -615,3 +615,100 @@ Profile、gate、state-log 與 audit，超出 rc.5 的合理表面積。
 
 `PASS` 的 evidence 另外要求自洽：`Checks executed` 必須與實際的 `Exit code:` 紀錄筆數相符，
 且每筆都是 0；`Change` 欄位必須與當前 change 相符。
+
+## 批准綁定的是「會被 commit 出去的那一份」（rc.5）
+
+`spec_digest` / `test_design_digest` / profile digest 原本只讀磁碟。那證明的是
+**本機現在看到什麼**，不是 **clone 之後會拿到什麼** —— 也就是 fresh-clone 不變式
+只套用在 hook 上，沒有套用在**內容**上。兩個實測繞過：
+
+1. **未追蹤的 artifact**：openspec / test-design / profile 建立但從未 commit，
+   approve 成功綁定 worktree digest，之後只依指示提交 STATE + state-log。
+   本機一路通過，fresh clone 拿到一份宣稱「已批准」而被批准的東西根本不存在的 STATE。
+2. **index / worktree 分裂**：批准 Spec A 之後把內容改成 B 並 `git add`，再把
+   worktree 檔案還原成 A（保留 index 的 B），連同產品程式碼一起 commit。
+   Gate 對 spec 路徑走 AI-writable 豁免，digest 比對讀的是 worktree 的 A 因此放行 ——
+   但 commit 與 fresh clone 拿到的是從未被批准的 B。
+
+判準因此是 `content_sources_agree`：**worktree / index / HEAD 三者必須是同一份，
+且必須存在於 HEAD**。三者比的是正規化後的內容，所以勾選進度仍可只存在於 worktree。
+
+`approve-spec` / `approve-tests` 在 TTY **前後**都檢查 —— 只檢查前面的話，
+等待期間把改動 stage 進 index 不會讓 worktree digest 失效，但 commit 出去的是 index 那一份。
+
+### 兩層都要有測試
+
+「批准後內容被換掉」有兩種形狀，由不同的一層擋下：
+
+| 形狀 | 擋下的層 |
+|---|---|
+| 只改 worktree（不 stage） | 三來源綁定 |
+| 改完並 commit | digest 比對 |
+
+只測前者的話，digest 那層可以被整個刪掉而測試全綠。這是 N3 與 Q7c 之後第三次
+遇到同一個坑，所以寫成規則：**每加一層，就要有一個只有那一層擋得住的測試。**
+
+## 勾選正規化的套用範圍（rc.5）
+
+`- [x]` 是進度還是決策，取決於它在哪個檔案裡。
+
+- `tasks.md`（檔名以 `task` 開頭）與 test-case 檔：**進度**，正規化掉。
+- proposal / specs / design：**決策**，逐字綁定。
+
+原本對整個 change 目錄一律正規化，於是最常見的規格寫法 ——
+
+```markdown
+## 已批准範圍
+- [ ] 啟用未驗證的公開付款 API
+```
+
+—— 被勾成 `[x]` 之後 digest 完全不變，而那是相反的決定。
+
+同一段程式的 `errors='replace'` 也要改掉：replace 會把不同的非法 byte sequence
+摘要成同一段文字（全部變成 U+FFFD），等於在 digest 上製造碰撞。非 UTF-8 一律
+fail-closed 回 `None`。
+
+## Evidence 凍結的判準是所有權，不是階段（rc.5）
+
+第一版用 `s.phase=='ARCHIVE'` 當凍結條件。那是全域旗標，而 evidence 是分 change 的 ——
+執行 `start-change B` 之後 phase 離開 ARCHIVE，change A 的已封存 evidence 立刻又可寫，
+而 A 已封存、archive 不會再跑，沒有任何一條路徑會再去比對它。
+
+正確判準（`evidence_write_allowed`）：**只有目前 active change、且正處於
+ENGINEERING / VERIFICATION，才能寫自己的 evidence。** 其餘一律凍結 ——
+包含歷史 change 的，以及本輪尚未進入工程階段的。
+
+`start-change` 從 ARCHIVE 出發前另外要求 **ARCHIVE transition 已進入 HEAD**：
+清掉 STATE 上一輪的三個 digest 之前，那份 STATE 必須先被保存下來，
+否則 `archive A → start-change B` 中間不 commit，唯一記載 A 完整 digest 的
+STATE 會被直接覆寫，從未進入任何 commit。
+
+## Journey 的 schema 必須完整驗證（rc.5）
+
+`- [J 2] 結帳`（ID 裡多一個空格）原本會被 `findall` 直接忽略。於是 J1 讓 profile
+看起來「已定義」，人類以為自己批准了兩條 journey，而 browser evidence 只寫
+`J1: PASS` 就通過。**靜默忽略不合法的輸入，等於把打錯字變成關閉檢查** ——
+跟 `Type: WEB_AP` 那個 typo 靜默關掉 Browser Gate 是同一個病。
+
+因此 `journeys_status` 回傳 `(journeys, errors)`，三條規則：
+
+1. journey 區段內每個列表項目都必須符合 `- [J<n>] 描述`，不合格式即為 profile 的 invalid 值。
+2. ID 必須唯一 —— 重複時單一行 `J1: PASS` 會同時滿足多條，一次驗證兌換多條覆蓋宣稱。
+3. browser evidence 中每個 required ID 必須**恰好一筆**結果。`J1: PASS` 與 `J1: FAIL`
+   並存時 `re.search` 只取第一筆而放行；矛盾的結果不是「其中一筆有效」，
+   是這份 evidence 不可信。
+
+能力邊界不變：這驗證的是**宣稱**，不是那些 journey 真的被執行過。要擋「寫了
+PASS 但沒跑」，需要 Playwright test id 與 journey id 對應、從 report 反查 ——
+那是下一層工程，rc.5 明確不做。
+
+## 測試 fixture 必須是真的 git repository（rc.5）
+
+被批准的內容要綁到 worktree / index / HEAD，而 Starter 本來就要求 git
+（bootstrap 會安裝 hook）。一個沒有 git 的 fixture 模擬的是真實安裝不會存在的狀態，
+它讓所有依賴 Git 歷史的判準退化成「取不到就跳過」—— **那是最糟的一種綠燈**。
+
+同理，`git commit` 不加 pathspec 會提交**整個 index**。測試若要「掉包被批准內容、
+但把產品變更留在 staged」，必須寫成 `git commit -m msg -- <paths>`；
+少了 pathspec，待驗的產品檔案會被一起 commit 掉，gate 沒東西可看，測試假綠。
+

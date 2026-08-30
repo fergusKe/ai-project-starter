@@ -47,6 +47,20 @@ python3 workflow/bin/workflow_transition.py status
 指令一律加前綴 `python3 workflow/bin/workflow_transition.py`。
 每次 transition 之後，**先單獨提交 `workflow/STATE.md` 與 `workflow/state-log.md`**，再繼續下一階段的工作。
 
+**批准之前，被批准的內容必須先 commit。** `approve-spec` 會檢查
+`PROJECT-PROFILE.md` 與 `openspec/changes/<change>/**`、`approve-tests` 會檢查
+`workflow/test-cases/<change>.md` —— 三者都必須存在於 HEAD，且 worktree / index /
+HEAD 是同一份。理由：批准綁定的是**會被 commit 出去的那一份**，不是本機當下看到的
+那一份。少了這條，STATE 可以宣稱「已批准」而 fresh clone 拿不到任何被批准的東西。
+
+```bash
+git add PROJECT-PROFILE.md openspec/changes/<change>
+git commit -m "spec: <change> 送審版本"
+python3 workflow/bin/workflow_transition.py approve-spec <change>
+```
+
+進入 ENGINEERING 之後打勾（`- [ ]` → `- [x]`）不會使批准失效，改動任務或規格**文字**會。
+
 第一次導入：
 - `GREENFIELD`：新專案，從需求探索開始。
 - `BROWNFIELD`：既有專案，先掃描 Repository、補 Context/Profile，再只對新 change 建 OpenSpec。

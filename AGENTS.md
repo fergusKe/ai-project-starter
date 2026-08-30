@@ -87,7 +87,7 @@ Web policy 必須明確；UNKNOWN/auto 未決 fail-closed。WEB_APP 無法用 `n
 非 Web 專案（`Web verification required: no`）標記 NOT APPLICABLE 只代表「不需要瀏覽器」，不代表「不需要真的跑一次」。API 專案的端點驗證（正確／錯誤／權限三類情境）見 `workflow/DEPLOYMENT.md`。
 
 ## Git / CI
-Transition CLI 不自動 commit；每次 transition 後先獨立提交 STATE+state-log。不得靜默覆蓋既有 Husky/Lefthook/pre-commit/core.hooksPath；依 `workflow/CI.md` 建立實際 CI。
+Transition CLI 不自動 commit；每次 transition 後先獨立提交 STATE+state-log。**approve-spec / approve-tests 之前必須先 commit 被批准的內容**（PROJECT-PROFILE、openspec/changes/<change>、workflow/test-cases/<change>.md）——批准綁的是會被 commit 出去的那一份，worktree/index/HEAD 必須一致。不得靜默覆蓋既有 Husky/Lefthook/pre-commit/core.hooksPath；依 `workflow/CI.md` 建立實際 CI。
 
 本機 pre-commit 擋不住 `git commit --no-verify`；伺服器端的 required status check 才是真正的 gate。設定與失敗實測見 `workflow/MERGE-PROTECTION.md`。
 

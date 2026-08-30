@@ -78,6 +78,12 @@ sys.exit(0)
   
  def tearDown(self):shutil.rmtree(self.tmp,ignore_errors=True)
  def cli(self,*a):return run(self.r,'python3','workflow/bin/workflow_transition.py',*a)
+ def commit_paths(self,*paths,msg='fixture'):
+  """把指定路徑送進 HEAD。被批准的內容必須存在於 Git 歷史，且 worktree/index/HEAD
+  一致 —— 否則 STATE 宣稱「已批准」而 fresh clone 拿不到被批准的東西。
+  pathspec 不可省略：`git commit` 不加它會提交整個 index。"""
+  run(self.r,'git','add','--',*paths)
+  return run(self.r,'git','-c','core.hooksPath=/dev/null','commit','--no-verify','-m',msg,'--',*paths)
  def commit_transition(self,msg):
   run(self.r,'git','add','workflow/STATE.md','workflow/state-log.md')
   return run(self.r,'git','commit','-m',msg)
@@ -121,8 +127,11 @@ sys.exit(0)
    t=t.replace(a,b)
   p.write_text(t);
   for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.assertEqual(self.cli(*a).returncode,0);self.assertEqual(self.commit_transition(a[0]).returncode,0)
+  # 批准之前，被批准的內容必須已經在 HEAD 且三來源一致。
+  self.assertEqual(self.commit_paths('PROJECT-PROFILE.md','openspec/changes/demo',msg='spec artifacts').returncode,0)
   self.approve_internal('spec');self.assertEqual(self.commit_transition('approve spec').returncode,0)
   (self.r/'workflow/test-cases/demo.md').write_text('cases')
+  self.assertEqual(self.commit_paths('workflow/test-cases/demo.md',msg='test design').returncode,0)
   self.approve_internal('tests');self.assertEqual(self.commit_transition('approve tests').returncode,0)
   self.assertEqual(self.cli('start-engineering','demo').returncode,0);self.assertEqual(self.commit_transition('start engineering').returncode,0)
  def test_non_web_disc_to_archive(self):
@@ -141,6 +150,7 @@ sys.exit(0)
   # front half to review
   p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: UNKNOWN','Type: API').replace('Web verification required: auto','Web verification required: no').replace('Primary stack: UNKNOWN','Primary stack: Python 3.12').replace('Package manager: UNKNOWN','Package manager: uv').replace('Monorepo: UNKNOWN','Monorepo: no').replace('CI provider: UNKNOWN','CI provider: GitHub Actions').replace('Test database strategy: UNKNOWN','Test database strategy: not-applicable'));
   for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.cli(*a);self.commit_transition(a[0])
+  self.commit_paths('PROJECT-PROFILE.md','openspec/changes/demo',msg='spec artifacts')
   self.assertEqual(self.cli('approve-spec','demo').returncode,20)
  def test_unknown_auto_fails_closed(self):
   self.prep_to_engineering(False);p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: API','Type: UNKNOWN').replace('Web verification required: no','Web verification required: auto'))

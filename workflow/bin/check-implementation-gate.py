@@ -4,7 +4,7 @@ import re,subprocess,sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
 from workflow_state import (
     parse_state,path_is_control_plane,path_is_ai_writable_non_product,
-    state_hash_text,initial_state_hash,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,
+    state_hash_text,initial_state_hash,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE,evidence_write_allowed,
     staged_changes,change_touches_control_plane,installation_baseline,installation_unexpected_changes,
     implementation_authorized,
 )
@@ -70,21 +70,25 @@ for c in changes:
 if control:
     fail('Control Plane 變更不可透過一般 commit；請由人類執行 workflow_transition.py control-plane-commit:\n  - '+'\n  - '.join(control),20)
 
-# ARCHIVE 之後，被接受的 evidence 必須凍結。
-# 原本 core/browser evidence 在下面的 product 判定裡被無條件豁免（因為它們由 machine
-# 產生、不算產品程式碼），但那個豁免沒有分階段。結果是 archive 完成後仍可用 shell 或
-# 一般編輯器改 evidence 再單獨 commit，而 STATE 繼續顯示 ARCHIVE、archive 也不能重跑。
-# state-log 裡有 digest 可供人工比對，但沒有任何一般 commit、status 或 CI audit 會去比。
-if s.phase=='ARCHIVE':
-    frozen=[]
-    for c in changes:
-        for pth in c.paths:
-            if CORE_EVIDENCE_RE.match(pth) or BROWSER_EVIDENCE_RE.match(pth):
-                frozen.append(f'{c.status}: '+(' -> '.join(c.paths) if c.status=='R' else pth))
-                break
-    if frozen:
-        fail('ARCHIVE 之後不得修改已封存的 evidence：\n  - '+'\n  - '.join(frozen)
-             +'\n新的一輪請先 start-change；新 change 有自己的 evidence 目錄。',16)
+# Evidence 的可寫範圍由「哪一個 change、在哪一個階段」決定，不由全域 phase 決定。
+# 原本 core/browser evidence 在下面的 product 判定裡被無條件豁免（它們由 machine 產生、
+# 不算產品程式碼），而那個豁免完全沒有分階段也沒有分 change。第一版修法用
+# `s.phase=='ARCHIVE'` 補洞，但那只擋住「archive 完就地改」這一種；只要執行
+# `start-change B`，phase 離開 ARCHIVE，change A 的已封存 evidence 立刻又可寫，
+# 而 A 不會再被任何 archive 或 verification 比對。判準必須是所有權，見
+# workflow_state.evidence_write_allowed。
+frozen=[]
+for c in changes:
+    for pth in c.paths:
+        if not (CORE_EVIDENCE_RE.match(pth) or BROWSER_EVIDENCE_RE.match(pth)):continue
+        if evidence_write_allowed(pth,s):continue
+        frozen.append(f'{c.status}: '+(' -> '.join(c.paths) if c.status=='R' else pth))
+        break
+if frozen:
+    fail('不得修改不屬於目前工作範圍的 evidence：\n  - '+'\n  - '.join(frozen)
+         +f'\n目前 change={s.active_change}、phase={s.phase}。'
+         '\nevidence 只能由目前 active change 在 ENGINEERING/VERIFICATION 期間寫入；'
+         '\n已封存的、以及其他 change 的 evidence 一律凍結。',16)
 
 # Determine product impact from every side of a mutation. This prevents renaming product/CP out to an AI-writable destination.
 product=[]
@@ -92,7 +96,8 @@ for c in changes:
     if any(p in {STATE_PATH,LOG_PATH} for p in c.paths):continue
     mutation_product=False
     for p in c.paths:
-        if path_is_ai_writable_non_product(p,s.phase) or CORE_EVIDENCE_RE.match(p) or BROWSER_EVIDENCE_RE.match(p):
+        # evidence 走 ownership 判準；不合格的在上面已經硬性失敗，到不了這裡。
+        if path_is_ai_writable_non_product(p,s.phase) or evidence_write_allowed(p,s):
             continue
         mutation_product=True
     if mutation_product:
