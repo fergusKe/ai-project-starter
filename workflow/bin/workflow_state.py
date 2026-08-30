@@ -903,7 +903,17 @@ def installation_preflight(root:Path):
     return installation_conflicts(root), installation_overwrites(root)
 
 def installation_baseline(root:Path,changes:list[GitChange],source:str)->bool:
-    """Sanctioned starter install: pristine STATE is newly added and all CP mutations are initial additions."""
+    """Sanctioned starter install: pristine STATE is newly added and all CP mutations are initial additions.
+
+    **這只判斷「形狀像不像一次合法安裝」，不判斷「有沒有夾帶別的東西」。**
+    單獨使用不足以豁免一個 commit —— 必須同時檢查 `installation_unexpected_changes()`
+    為空，否則一個 commit 可以同時加入合法 baseline 與 `src/payment.py`，
+    整個 commit 被跳過。實測可重現。
+
+    為什麼不把兩者合併成一個判準：本機 gate 需要分開報。「這不是安裝 baseline」與
+    「這是安裝 baseline 但混了產品變更」是兩件事，合併之後使用者只會拿到一則
+    「Control Plane mutations: (none)」的無用訊息。判準分開、呼叫端一起用。
+    """
     state_add=[c for c in changes if c.status=='A' and c.new_path=='workflow/STATE.md']
     if len(state_add)!=1: return False
     state_bytes=_blob_bytes(root,f':workflow/STATE.md' if source=='staged' else f'{source}:workflow/STATE.md')

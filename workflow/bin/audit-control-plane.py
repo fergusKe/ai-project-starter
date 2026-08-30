@@ -3,13 +3,32 @@ from pathlib import Path
 import argparse,re,subprocess,sys
 ROOT=Path(__file__).resolve().parents[2];sys.path.insert(0,str(ROOT/'workflow/bin'))
 from workflow_state import (audit_commit_changes,change_touches_control_plane,control_plane_digest,
- parse_state_text,installation_baseline,AUDIT_FAIL_CLOSED_PHASE,
+ parse_state_text,installation_baseline,installation_unexpected_changes,AUDIT_FAIL_CLOSED_PHASE,
  path_is_ai_writable_non_product,evidence_write_allowed,implementation_authorized_at,
  path_is_installation_scaffolding,
  state_hash_text,CORE_EVIDENCE_RE,BROWSER_EVIDENCE_RE)
 STATE_PATH='workflow/STATE.md';LOG_PATH='workflow/state-log.md'
 
 def g(*a,text=True):return subprocess.run(['git','-C',str(ROOT),*a],capture_output=True,text=text)
+
+def appended_log_declares_install(commit):
+ """本 commit **自己新追加**的那一段 state-log 是否宣告安裝。
+
+ 不能用 `log_has_action` 在累積 log 裡找：state-log 是 append-only，Brownfield
+ 只要曾經安裝過一次 Starter，之後**每一個** commit 的 log 都仍含那筆 action，
+ 豁免因此永久生效。實測重現 —— 安裝之後在 DISCOVERY 新增 `templates/rogue.sh`
+ （`templates/` 屬安裝範圍），未經任何批准仍被放行。
+
+ 豁免必須同時綁定事件、時間與路徑，只滿足其中一項不夠。
+ """
+ parent=parent_of(commit)
+ after=log_bytes(commit) or b''
+ before=(log_bytes(parent) or b'') if parent else b''
+ if not after.startswith(before):return False   # 連續性違規；此處 fail-closed
+ appended=after[len(before):]
+ try:txt=appended.decode('utf-8')
+ except UnicodeDecodeError:return False
+ return re.search(r'(?m)^- Action:\s*install-adopt-control-plane\s*$',txt) is not None
 
 def state_at(commit):
  """該 commit 的完整 STATE。取不到或壞掉回 None。"""
@@ -147,7 +166,10 @@ def main():
   phase=state_phase_at(c)
 
   # Sanctioned Greenfield/Brownfield Starter installation baseline is not a maintenance commit.
-  if installation_baseline(ROOT,changes,c):
+  # installation_baseline 只判斷「形狀像不像安裝」，不判斷「有沒有夾帶別的東西」。
+  # 本機 gate 是分兩段檢查的（exit 24 與 exit 25）；稽核端原本只做第一段，
+  # 於是一個 commit 可以同時加入合法 baseline 與 src/payment.py 而整個被跳過。
+  if installation_baseline(ROOT,changes,c) and not installation_unexpected_changes(changes):
    continue
 
   # Audit continuity: state-log may append, but may never be deleted, renamed, or shortened.
@@ -166,7 +188,7 @@ def main():
   # 一致」，那個宣稱比 MERGE-PROTECTION.md 寫的窄得多：它看不到未經批准的產品變更，
   # 也刻意把 STATE-only 的變更排除在外。兩者都實測可繞過。
   cp=[ch for ch in changes if change_touches_control_plane(ch,phase) and not all(p in {STATE_PATH,LOG_PATH} for p in ch.paths)]
-  installing=log_has_action(c,'install-adopt-control-plane')
+  installing=appended_log_declares_install(c)
   problems=workflow_authorization_violations(c,changes,state_at(c),installing)
   if cp:
    exp=control_plane_digest(ROOT,cp,c)
