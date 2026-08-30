@@ -1,0 +1,45 @@
+# Starter **自己**的 CI。
+#
+# 注意：這裡刻意**沒有** control-plane-audit。本 repo 是 Starter 原始碼，不是採用
+# Starter 的專案（見 DEVELOPING.md）—— 它刻意不設 core.hooksPath，STATE.md 是出貨
+# 模板，因此對它自己的歷史跑 runtime audit 預期會失敗。採用者才需要那份 workflow，
+# 範本在 templates/github-workflow-control-plane-audit.yml。
+#
+# 形狀依 workflow/CI.md：互不依賴的工作平行跑，不串成一條。
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: test-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Run Starter self tests
+        run: python3 workflow/bin/run-tests.py
+
+  acceptance:
+    name: release-acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Full lifecycle on a disposable consumer repo
+        run: python3 workflow/bin/acceptance.py
