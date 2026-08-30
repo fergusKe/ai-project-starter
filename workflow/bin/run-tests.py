@@ -36,8 +36,14 @@ def discover():
 def run_one(target):
     mod, cls = target
     t0 = time.time()
+    # **不要寫 bytecode。** 有幾條測試會從 SRC 的 workflow/bin import（那是刻意的：
+    # 它們驗證的是出貨的那一份判準），於是跑測試本身會在出貨目錄裡產生 __pycache__ ——
+    # 而 test_shipped_manifest_entries_exist 正是在檢查出貨目錄不得有生成物。
+    # 序列執行時碰巧沒撞到，平行執行 + CI 的乾淨 checkout 就穩定重現。
+    # **測試套件不該污染它自己在稽核的那棵樹。**
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
     r = subprocess.run([sys.executable, '-m', 'unittest', f'{mod}.{cls}'],
-                       cwd=ROOT, capture_output=True, text=True)
+                       cwd=ROOT, capture_output=True, text=True, env=env)
     return cls, r.returncode, time.time() - t0, r.stdout + r.stderr
 
 

@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # 見 workflow/bin/run-tests.py：測試會從出貨目錄 import，
+  # 寫出的 __pycache__ 會讓 shipped-manifest 的乾淨度檢查失敗。
+  PYTHONDONTWRITEBYTECODE: '1'
+
 jobs:
   unit:
     name: test-suite

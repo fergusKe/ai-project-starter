@@ -578,6 +578,11 @@ class V1ManifestAndRevertTests(unittest.TestCase):
         for rel in entries:
             self.assertTrue((SRC/rel).exists(),rel)
         self.assertNotIn('.github',entries)
+        # 這條同時也在保護「測試套件不得污染它自己稽核的那棵樹」——
+        # 有幾條測試刻意從 SRC 的 workflow/bin import（驗證出貨的那一份判準），
+        # 若 Python 寫出 bytecode 就會在這裡被抓到。run-tests.py 與 CI 都設了
+        # PYTHONDONTWRITEBYTECODE=1；直接跑 unittest 時可能會看到這條失敗，
+        # 那是正確的訊號，不是誤報。
         forbidden=[]
         for rel in entries:
             root=SRC/rel
