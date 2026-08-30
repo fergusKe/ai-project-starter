@@ -11,6 +11,7 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  probe_fingerprint,finalize_probe_receipt,approved_profile_status,approved_content_status,
  spec_digest,test_design_digest,critical_journeys,journeys_status,parse_state_text,
  artifact_binding_status,PROFILE_ARTIFACT,spec_artifact,test_design_artifact,
+ api_verification_required,
  ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance,validate_change_id)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
@@ -212,6 +213,49 @@ def _core_evidence_semantics(path,expected_change=None):
 
 def core_success(path):
  ok,_=core_evidence_status(path);return ok
+def api_file(change):return edir(change)/'api.md'
+API_RESULT_RE=re.compile(r'^(J\d+):[ \t]*(.+?)[ \t]*$',re.M)
+API_CATEGORIES=('success','validation','authorization')
+def validate_api(change):
+ """`Type: API` 的端點驗證 evidence。與 Browser Gate 同形狀、同能力邊界。
+
+ 三類情境缺一不可。權限那一類最容易被跳過也最容易出事：前端把選單做成下拉式，
+ 不代表後端擋得住手動送出的非法值；前端把按鈕藏起來，不代表後端擋得住直接打 API。
+ """
+ if not api_verification_required(ROOT):return
+ journeys,errors=journeys_status(ROOT)
+ if errors:
+  die('PROJECT-PROFILE 的 critical user journeys 有不合法的項目，無法判定驗證範圍：\n  - '
+      +'\n  - '.join(f'{v}：{why}' for _,v,why in errors),58)
+ if not journeys:
+  die('API 專案必須在 PROJECT-PROFILE 以 `- [J1] 描述` 列出 critical user journeys',58)
+ p=api_file(change)
+ if not p.exists():
+  die(f'缺少 API 驗證 evidence：workflow/evidence/{change}/api.md\n'
+      '  `Web verification required: no` 只表示不需要瀏覽器，不表示不需要真的跑一次。\n'
+      '  每條 journey 需要一行：\n'
+      '    J1: success=PASS validation=PASS authorization=PASS\n'
+      '  authorization 若該端點確實沒有權限概念，寫 `authorization=not-applicable`。\n'
+      '  做法見 workflow/DEPLOYMENT.md〈API 專案的真實驗證〉。',58)
+ t=p.read_text(encoding='utf-8')
+ missing=[];dup=[];bad=[]
+ for jid,desc in journeys:
+  ms=[m for m in API_RESULT_RE.finditer(t) if m.group(1)==jid]
+  if not ms:missing.append(f'{jid}（{desc}）');continue
+  if len(ms)>1:dup.append(f'{jid}（{len(ms)} 筆）');continue
+  body=ms[0].group(2)
+  for cat in API_CATEGORIES:
+   m=re.search(rf'\b{cat}=(\S+)',body)
+   if not m:bad.append(f'{jid}：缺少 {cat}=');continue
+   v=m.group(1).lower()
+   if v not in ('pass','not-applicable'):bad.append(f'{jid}：{cat}={m.group(1)}')
+ if missing:
+  die('API evidence 沒有涵蓋下列已批准的 critical journey：\n  - '+'\n  - '.join(missing),58)
+ if dup:
+  die('同一個 journey 有多筆結果，evidence 不可信：\n  - '+'\n  - '.join(dup),58)
+ if bad:
+  die('API evidence 的三類情境未全部通過：\n  - '+'\n  - '.join(bad)
+      +'\n  每條 journey 都要有 success / validation / authorization 三類結果。',58)
 def validate_browser(change):
  status=project_web_status(ROOT)
  if status=='UNRESOLVED':die('Web Gate 判定未決；請先明確設定 PROJECT-PROFILE',52)
@@ -220,6 +264,7 @@ def validate_browser(change):
  t=p.read_text(encoding='utf-8');not_app='Browser Gate: NOT APPLICABLE' in t
  if status=='NON_WEB':
   if not not_app:die('非 Web 專案缺少 NOT APPLICABLE browser evidence',53)
+  validate_api(change)
   return
  if not_app:die('Web 專案不可使用 NOT APPLICABLE',49)
  mcore=re.search(r'^Core evidence:\s*(\S+)\s*$',t,re.M);mreport=re.search(r'^Playwright report:\s*(\S+)\s*$',t,re.M)

@@ -150,7 +150,7 @@ class HookDecisionTests(unittest.TestCase):
     def setUp(self):
         self.td,self.r=fixture()
     def tearDown(self): shutil.rmtree(self.td,ignore_errors=True)
-    def set_state(self,phase="ENGINEERING",typ="API",web="no"):
+    def set_state(self,phase="ENGINEERING",typ="CLI",web="no"):
         p=self.r/"workflow/STATE.md"
         import re
         t=p.read_text()
@@ -2738,7 +2738,7 @@ class RC5Round12Tests(unittest.TestCase):
         p.write_text(t,encoding='utf-8')
 
     def _resolve_profile(self,r):
-        self._set_profile(r,Type='API',Web_verification_required='no',
+        self._set_profile(r,Type='CLI',Web_verification_required='no',
                           Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                           CI_provider='GitHub Actions',
                           Test_database_strategy='not-applicable')
@@ -3208,7 +3208,7 @@ class RC5Round13Tests(unittest.TestCase):
 
     def _approved_engineering(self,r):
         """做出一個「已批准 policy=auto、已在 ENGINEERING」的合法狀態。"""
-        self._set_profile(r,Type='API',Web_verification_required='no',
+        self._set_profile(r,Type='CLI',Web_verification_required='no',
                           Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                           CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
         (r/'openspec/changes/demo').mkdir(parents=True,exist_ok=True)
@@ -3551,7 +3551,7 @@ class RC5Round15Tests(unittest.TestCase):
 
     def _engineering(self,r,change='demo'):
         """已批准 profile/spec/test-design 且位於 ENGINEERING 的合法狀態。"""
-        self._set_profile(r,Type='API',Web_verification_required='no',
+        self._set_profile(r,Type='CLI',Web_verification_required='no',
                           Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                           CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
         d=r/'openspec/changes'/change; d.mkdir(parents=True,exist_ok=True)
@@ -3905,7 +3905,7 @@ class RC5Round16Tests(unittest.TestCase):
         p.write_text(t,encoding='utf-8')
 
     def _engineering(self,r,change='demo',web=False):
-        self._set_profile(r,Type='WEB_APP' if web else 'API',
+        self._set_profile(r,Type='WEB_APP' if web else 'CLI',
                           Web_verification_required='yes' if web else 'no',
                           Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                           CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
@@ -4173,7 +4173,7 @@ class RC5Round16Tests(unittest.TestCase):
         而被批准的東西根本不存在的 STATE。"""
         td,r=self._repo()
         try:
-            self._set_profile(r,Type='API',Web_verification_required='no',
+            self._set_profile(r,Type='CLI',Web_verification_required='no',
                               Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
                               CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
             recommit(r,'baseline')
@@ -4460,6 +4460,154 @@ class RC5Round17ServerAuditTests(unittest.TestCase):
                 self.assertTrue(W.path_is_control_plane(rel,'ENGINEERING'),
                                 f'{rel} 必須受 Control Plane 保護')
         finally: sys.path.remove(str(SRC/'workflow/bin'))
+
+
+class RC5Round18ApiVerificationTests(unittest.TestCase):
+    """`Type: API` 的端點驗證必須有機制，不能只是一句規範。
+
+    `AGENTS.md` 與 `BROWSER-VERIFICATION.md` 都寫著「非 Web 專案標記 NOT APPLICABLE
+    只代表不需要瀏覽器，不代表不需要真的跑一次」—— 但在此之前那是一句
+    **沒有機制的規範**：一個 API 專案只要 lint 通過就能 archive，沒有任何東西
+    證明端點被實際打過。這與 MERGE-PROTECTION 那次是同一個錯誤。
+
+    能力邊界與 Browser Gate 相同：驗證的是**宣稱涵蓋範圍**，不是 request 真的送出過。
+    """
+
+    def _repo(self, typ='API', journeys=True):
+        td=Path(tempfile.mkdtemp(prefix='rc5r18-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        pp=r/'PROJECT-PROFILE.md'; s=pp.read_text(encoding='utf-8')
+        s=s.replace('Type: UNKNOWN',f'Type: {typ}').replace(
+            'Web verification required: auto','Web verification required: no')
+        if journeys:
+            s=s.replace('## Critical user journeys\n- 尚未定義',
+                        '## Critical user journeys\n- [J1] 查詢車輛列表\n- [J2] 管理員新增員工')
+        pp.write_text(s,encoding='utf-8')
+        st=r/'workflow/STATE.md'
+        st.write_text(st.read_text(encoding='utf-8')
+                      .replace('Active OpenSpec change: none','Active OpenSpec change: demo'),
+                      encoding='utf-8')
+        (r/'workflow/evidence/demo').mkdir(parents=True)
+        return td,r
+
+    def _validate(self, r):
+        """直接呼叫驗證器 —— 走 verification-pass 會先卡在 verify.sh，
+        那樣測到的是別的東西（Q7c 的教訓）。"""
+        import contextlib, io
+        sys.path.insert(0,str(r/'workflow/bin'))
+        try:
+            import workflow_state as W, workflow_transition as T
+            importlib.reload(W); importlib.reload(T)
+            err=io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    T.validate_api('demo')
+                return 0, err.getvalue()
+            except SystemExit as e:
+                return e.code, err.getvalue()
+        finally: sys.path.remove(str(r/'workflow/bin'))
+
+    def _write_api(self, r, body):
+        (r/'workflow/evidence/demo/api.md').write_text(body,encoding='utf-8')
+
+    def test_api_project_must_declare_journeys(self):
+        """API 與 WEB 一樣有「對外的關鍵流程」，而那決定驗證的範圍。"""
+        td,r=self._repo(journeys=False)
+        try:
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W; importlib.reload(W)
+                unres,_,_,dg=W.profile_resolution(r)
+                self.assertTrue(any('journey' in x.lower() for x in unres),
+                                f'API 專案沒有 journeys 時 profile 不得解析完成：{unres}')
+                self.assertIsNone(dg)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_missing_api_evidence_is_rejected(self):
+        """**核心重現。** 在此之前，API 專案只要 lint 通過就能 archive。"""
+        td,r=self._repo()
+        try:
+            code,err=self._validate(r)
+            self.assertEqual(code,58,err)
+            self.assertIn('缺少 API 驗證 evidence',err,err)
+            self.assertIn('不表示不需要真的跑一次',err,'訊息要說明為什麼\n'+err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_uncovered_journey_is_rejected(self):
+        td,r=self._repo()
+        try:
+            self._write_api(r,'# API Verification\nJ1: success=PASS validation=PASS authorization=PASS\n')
+            code,err=self._validate(r)
+            self.assertEqual(code,58,err)
+            self.assertIn('沒有涵蓋',err,err)
+            self.assertIn('J2',err,err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_missing_authorization_category_is_rejected(self):
+        """**權限那一類最容易被跳過，也最容易出事。**
+
+        前端把選單做成下拉式，不代表後端擋得住手動送出的非法值；
+        前端把按鈕藏起來，不代表後端擋得住直接打 API。
+        """
+        td,r=self._repo()
+        try:
+            self._write_api(r,'J1: success=PASS validation=PASS\n'
+                              'J2: success=PASS validation=PASS authorization=PASS\n')
+            code,err=self._validate(r)
+            self.assertEqual(code,58,err)
+            self.assertIn('缺少 authorization=',err,err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_failing_category_is_rejected(self):
+        td,r=self._repo()
+        try:
+            self._write_api(r,'J1: success=PASS validation=PASS authorization=FAIL\n'
+                              'J2: success=PASS validation=PASS authorization=PASS\n')
+            code,err=self._validate(r)
+            self.assertEqual(code,58,err)
+            self.assertIn('authorization=FAIL',err,err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_duplicate_journey_result_is_rejected(self):
+        """矛盾的結果不是「其中一筆有效」，是這份 evidence 不可信。"""
+        td,r=self._repo()
+        try:
+            self._write_api(r,'J1: success=PASS validation=PASS authorization=PASS\n'
+                              'J1: success=FAIL validation=FAIL authorization=FAIL\n'
+                              'J2: success=PASS validation=PASS authorization=PASS\n')
+            code,err=self._validate(r)
+            self.assertEqual(code,58,err)
+            self.assertIn('多筆結果',err,err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_complete_api_evidence_passes(self):
+        """對照組。三類齊全且通過時必須放行 —— 否則這個 gate 只是噪音。
+        `not-applicable` 是合法值：確實沒有權限概念的端點不該被逼著造假。"""
+        td,r=self._repo()
+        try:
+            self._write_api(r,'# API Verification Evidence\n'
+                              'J1: success=PASS validation=PASS authorization=not-applicable\n'
+                              'J2: success=PASS validation=PASS authorization=PASS\n')
+            code,err=self._validate(r)
+            self.assertEqual(code,0,err)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_cli_project_is_not_required_to_provide_api_evidence(self):
+        """對照組。不得把要求擴大到沒有對外流程的專案類型 ——
+        強制 CLI/LIBRARY 填 journeys 等於製造假資料。"""
+        td,r=self._repo(typ='CLI',journeys=False)
+        try:
+            code,err=self._validate(r)
+            self.assertEqual(code,0,'CLI 專案不該被要求 API evidence\n'+err)
+        finally: shutil.rmtree(td,ignore_errors=True)
 
 
 # 必須放在檔案最末端。放在 class 定義之前會讓「直接執行本檔」只跑到當下已定義的少數測試，

@@ -111,7 +111,7 @@ sys.exit(0)
   with (self.r/'workflow/state-log.md').open('a') as f:f.write(f'## smoke\n- Actor: smoke-human\n- Action: approve-{kind}\n- Change: demo\n- From: X\n- To: {ns.phase}\n- Git SHA: SMOKE\n- State hash: {h}\n- Reason: smoke\n\n')
   sys.path.pop(0);sys.modules.pop('workflow_state',None)
  def prep_to_engineering(self,web=False):
-  p=self.r/'PROJECT-PROFILE.md';t=p.read_text().replace('Type: UNKNOWN','Type: WEB_APP' if web else 'Type: API').replace('Web verification required: auto','Web verification required: yes' if web else 'Web verification required: no')
+  p=self.r/'PROJECT-PROFILE.md';t=p.read_text().replace('Type: UNKNOWN','Type: WEB_APP' if web else 'Type: CLI').replace('Web verification required: auto','Web verification required: yes' if web else 'Web verification required: no')
   # 其餘必填欄位也要解析。approve-spec 是收取 profile 定案的邊界，
   # 讓 fixture 停在 UNKNOWN 等於繞過那個邊界去測後面的階段。
   if web:
@@ -149,11 +149,11 @@ sys.exit(0)
   r=self.cli('verification-pass','demo');self.assertNotEqual(r.returncode,0);core=sorted((self.r/'workflow/evidence/demo/core').glob('*.md'))[-1];self.assertIn('Overall exit code: 1',core.read_text());self.assertIn('Exit code: 1',core.read_text())
  def test_no_tty_approval(self):
   # front half to review
-  p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: UNKNOWN','Type: API').replace('Web verification required: auto','Web verification required: no').replace('Primary stack: UNKNOWN','Primary stack: Python 3.12').replace('Package manager: UNKNOWN','Package manager: uv').replace('Monorepo: UNKNOWN','Monorepo: no').replace('CI provider: UNKNOWN','CI provider: GitHub Actions').replace('Test database strategy: UNKNOWN','Test database strategy: not-applicable'));
+  p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: UNKNOWN','Type: CLI').replace('Web verification required: auto','Web verification required: no').replace('Primary stack: UNKNOWN','Primary stack: Python 3.12').replace('Package manager: UNKNOWN','Package manager: uv').replace('Monorepo: UNKNOWN','Monorepo: no').replace('CI provider: UNKNOWN','CI provider: GitHub Actions').replace('Test database strategy: UNKNOWN','Test database strategy: not-applicable'));
   self.commit_paths('PROJECT-PROFILE.md','openspec/changes/demo',msg='spec artifacts')
   for a in [('set-mode','GREENFIELD'),('start-change','demo'),('submit-for-review','demo')]:self.cli(*a);self.commit_transition(a[0])
   self.assertEqual(self.cli('approve-spec','demo').returncode,20)
  def test_unknown_auto_fails_closed(self):
-  self.prep_to_engineering(False);p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: API','Type: UNKNOWN').replace('Web verification required: no','Web verification required: auto'))
+  self.prep_to_engineering(False);p=self.r/'PROJECT-PROFILE.md';p.write_text(p.read_text().replace('Type: CLI','Type: UNKNOWN').replace('Web verification required: no','Web verification required: auto'))
   self.assertNotEqual(run(self.r,'bash','workflow/bin/verify.sh','--full').returncode,0)
 if __name__=='__main__':unittest.main()

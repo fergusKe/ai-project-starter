@@ -24,6 +24,7 @@ INSTALLATION_ALLOWED_ROOTS={'AGENTS.md','CLAUDE.md','CONTEXT.md','PROJECT-PROFIL
 INSTALLATION_ALLOWED_PREFIXES=('.claude/','.githooks/','docs/','openspec/','prompts/','templates/','workflow/')
 BROWSER_EVIDENCE_RE=re.compile(r"^workflow/evidence/[^/]+/browser\.md$")
 EVIDENCE_CHANGE_RE=re.compile(r"^workflow/evidence/([^/]+)/")
+API_EVIDENCE_RE=re.compile(r"^workflow/evidence/[^/]+/api\.md$")
 # Change identifier 的唯一合法形狀。這個名字會被當成 **path component** 使用
 # （`openspec/changes/<id>`、`workflow/evidence/<id>/…`），也會被寫進 STATE.md 與
 # append-only 的 state-log，所以它同時是路徑輸入與檔案格式輸入，兩邊都要守住。
@@ -1034,6 +1035,20 @@ def path_is_control_plane(rel:str,phase:str)->bool:
     if rel in CONTROL_PLANE_FILES or any(rel.startswith(p) for p in CONTROL_PLANE_PREFIXES): return True
     return rel in EARLY_MUTABLE_POLICY_FILES and phase not in {'DISCOVERY','SPECIFICATION'}
 
+def api_verification_required(root:Path, source:str='worktree')->bool:
+    """`Type: API` 的專案要求端點驗證 evidence。
+
+    `AGENTS.md` 與 `workflow/BROWSER-VERIFICATION.md` 都寫著「非 Web 專案標記
+    NOT APPLICABLE 只代表不需要瀏覽器，不代表不需要真的跑一次」——
+    但在此之前那是一句**沒有機制的規範**：一個 API 專案只要 lint 通過就能 archive，
+    沒有任何東西證明端點被實際打過。
+
+    這與 Browser Gate 是同一個形狀，能力邊界也一樣：驗證的是**宣稱涵蓋範圍**，
+    不是那些 request 真的被送出過。
+    """
+    return _field_in(profile_text(root, source), 'Type') == 'API'
+
+
 def evidence_write_allowed(rel:str, state)->bool:
     """這條 evidence 路徑在**目前狀態下**是否可寫。
 
@@ -1047,7 +1062,8 @@ def evidence_write_allowed(rel:str, state)->bool:
     階段（ENGINEERING / VERIFICATION），才能寫自己的 evidence。其餘一律凍結 ——
     包含歷史 change 的、以及尚未進入工程階段的本輪 change 的。
     """
-    if not (CORE_EVIDENCE_RE.match(rel) or BROWSER_EVIDENCE_RE.match(rel)): return False
+    if not (CORE_EVIDENCE_RE.match(rel) or BROWSER_EVIDENCE_RE.match(rel)
+            or API_EVIDENCE_RE.match(rel)): return False
     m = EVIDENCE_CHANGE_RE.match(rel)
     if not m: return False
     if m.group(1) != getattr(state,'active_change','none'): return False
@@ -1056,7 +1072,7 @@ def evidence_write_allowed(rel:str, state)->bool:
 
 def path_is_ai_writable_non_product(rel:str,phase:str)->bool:
     if rel in AI_WRITABLE_ROOT or any(rel.startswith(p) for p in AI_WRITABLE_PREFIXES): return True
-    if BROWSER_EVIDENCE_RE.match(rel): return True
+    if BROWSER_EVIDENCE_RE.match(rel) or API_EVIDENCE_RE.match(rel): return True
     if rel=='PROJECT-PROFILE.md' and phase in {'DISCOVERY','SPECIFICATION'}: return True
     return False
 
@@ -1181,9 +1197,10 @@ def profile_resolution_in(text):
     # 格式錯誤對**所有**專案都要報。非 WEB 專案不必填 journeys，但既然填了，
     # 一個寫壞的項目仍然代表使用者以為自己寫了某件事而系統沒收到。
     invalid.extend(journey_errors)
-    if project_web_status_in(text)=='WEB' and not journeys:
-        # 只對 WEB 專案要求。API/CLI 沒有 journey 可言，強制它們填等於製造假資料。
-        unresolved.append('Critical user journeys（WEB 專案必須以 `- [J1] 描述` 的形式列出）')
+    if (project_web_status_in(text)=='WEB' or _field_in(text,'Type')=='API') and not journeys:
+        # WEB 與 API 都要求。兩者都有「對外的關鍵流程」，而那決定了驗證的**範圍**。
+        # CLI / LIBRARY 沒有對應概念，強制它們填等於製造假資料。
+        unresolved.append('Critical user journeys（WEB 與 API 專案必須以 `- [J1] 描述` 的形式列出）')
     for name, default, allowed in PROFILE_POLICY_FIELDS:
         v = _field_in(text, name)
         if v is None or not v: v = default
