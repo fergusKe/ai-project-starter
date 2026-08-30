@@ -948,6 +948,9 @@ class WorkflowState:
     # 人類在 approve-spec 當下實際看到並批准的那份 profile 的 digest。
     # 預設 'none' 表示尚未批准，或這份 STATE 早於本欄位存在 —— 兩者都必須 fail-closed。
     profile_digest:str='none'
+    # 同理，但綁的是更核心的兩份批准物：OpenSpec change 的完整內容，以及 test design。
+    spec_digest:str='none'
+    test_design_digest:str='none'
     @property
     def implementation_allowed(self):
         return self.phase=="ENGINEERING" and self.spec_approved=="yes" and self.test_design_approved=="yes"
@@ -970,9 +973,13 @@ def parse_state_text(text:str)->WorkflowState:
     # 刻意讀成可選：這個欄位是後加的。舊的 STATE.md 缺少它時要能被解析並回報
     # 'none'，由 start-engineering fail-closed 要求重新批准 —— 而不是讓工具在
     # 讀取階段就整個掛掉，把「schema 舊了」變成「Control Plane 壞了」。
-    dg=re.findall(r"^Approved profile digest:[ \t]*(.*?)[ \t]*$",text,re.M)
-    if len(dg)>1: raise ValueError("STATE 欄位重複: Approved profile digest")
-    return WorkflowState(values["Phase"],values["Project mode"],values["Active OpenSpec change"],values["Spec approved"],values["Test design approved"],values["Verification passed"],values["Approved by"],values["Last updated"],dg[0] if dg else 'none')
+    opt={}
+    for key,attr in (("Approved profile digest",'profile'),("Approved spec digest",'spec'),
+                     ("Approved test design digest",'test')):
+        m=re.findall(rf"^{re.escape(key)}:[ \t]*(.*?)[ \t]*$",text,re.M)
+        if len(m)>1: raise ValueError(f"STATE 欄位重複: {key}")
+        opt[attr]=m[0] if m else 'none'
+    return WorkflowState(values["Phase"],values["Project mode"],values["Active OpenSpec change"],values["Spec approved"],values["Test design approved"],values["Verification passed"],values["Approved by"],values["Last updated"],opt['profile'],opt['spec'],opt['test'])
 
 def parse_state(path:Path)->WorkflowState:
     if not path.exists(): raise ValueError("workflow/STATE.md 不存在")
@@ -985,7 +992,9 @@ def render_state(s:WorkflowState)->str:
         "> `Implementation allowed` 為推導值，不儲存在 STATE：僅當 Phase=ENGINEERING 且 Spec/Test Design 均 approved 時為 true。\n\n"
         f"Phase: {s.phase}\nProject mode: {s.project_mode}\nActive OpenSpec change: {s.active_change}\n"
         f"Spec approved: {s.spec_approved}\nTest design approved: {s.test_design_approved}\nVerification passed: {s.verification_passed}\n"
-        f"Approved by: {s.approved_by}\nApproved profile digest: {s.profile_digest}\nLast updated: {s.last_updated}\n"
+        f"Approved by: {s.approved_by}\nApproved profile digest: {s.profile_digest}\n"
+        f"Approved spec digest: {s.spec_digest}\nApproved test design digest: {s.test_design_digest}\n"
+        f"Last updated: {s.last_updated}\n"
     )
 
 def write_state(path:Path,s:WorkflowState):
@@ -1106,6 +1115,9 @@ def profile_resolution(root:Path):
         if why:
             invalid.append((name, v, why)); continue
         resolved[name] = v
+    if project_web_status(root)=='WEB' and not critical_journeys(root):
+        # 只對 WEB 專案要求。API/CLI 沒有 journey 可言，強制它們填等於製造假資料。
+        unresolved.append('Critical user journeys（WEB 專案必須以 `- [J1] 描述` 的形式列出）')
     for name, default, allowed in PROFILE_POLICY_FIELDS:
         v = _profile_field(root, name)
         if v is None or not v: v = default
@@ -1119,7 +1131,149 @@ def profile_resolution(root:Path):
         return unresolved, invalid, resolved, None
     for name in sorted(resolved):
         h.update(name.encode()+b'\0'+resolved[name].encode()+b'\0')
+    # Critical user journeys 決定 Browser Verification 的**範圍**，因此屬於被批准的
+    # 內容。不納入 digest 的話：批准含「結帳、付款」的 profile 之後，只在 worktree
+    # 把它改成「首頁」，digest 完全不變，於是可以產生一份內容完整性無誤、
+    # 但驗證範圍從未被批准的 browser evidence。
+    h.update(b'Critical user journeys\0'+journeys_canonical(root).encode()+b'\0')
     return unresolved, invalid, resolved, h.hexdigest()
+
+
+JOURNEY_RE=re.compile(r'^\s*[-*]\s*\[(J\d+)\]\s*(\S.*?)\s*$', re.M)
+JOURNEY_UNDEFINED={'尚未定義','TBD','UNKNOWN',''}
+
+
+def critical_journeys(root:Path):
+    """`## Critical user journeys` 區段裡具**穩定 ID** 的項目，回傳 [(id, 文字)]。
+
+    為什麼要 ID 而不是自由文字：browser evidence 必須能被機械核對「宣稱覆蓋了哪些
+    被批准的 journey」。沒有穩定 ID 的話，只能比對整段文字，而那會讓任何排版改動
+    都變成 gate 失敗。
+
+    能力邊界（必須明講）：這只能驗證**宣稱**，不能驗證那些 journey 真的被執行過。
+    誠實執行仍是既有的能力邊界，見 GATES.md。
+    """
+    p = root/'PROJECT-PROFILE.md'
+    if not p.exists(): return []
+    # **先剝掉 HTML 註解。** 本檔在這個區段用註解放範例（`- [J1] 訪客可以…`），
+    # 不剝的話那些範例會被當成真的 journey —— 一份全新的 profile 會憑空「已定義」
+    # 兩個沒人寫過的 journey，而 WEB 專案的必填檢查也會被它們矇混過去。
+    text = re.sub(r'<!--.*?-->', '', p.read_text(encoding='utf-8'), flags=re.S)
+    m = re.search(r'^##\s*Critical user journeys\s*$(.*?)(?=^##\s|\Z)', text, re.M|re.S)
+    if not m: return []
+    out=[]
+    for jid, desc in JOURNEY_RE.findall(m.group(1)):
+        if desc.strip() in JOURNEY_UNDEFINED: continue
+        out.append((jid, desc.strip()))
+    return out
+
+
+def journeys_canonical(root:Path)->str:
+    """journeys 進 digest 用的正規化形式。ID 排序，避免順序調換就撤銷批准。"""
+    return '\n'.join(f'{jid}\t{desc}' for jid, desc in sorted(critical_journeys(root)))
+
+
+PROGRESS_LINE_RE=re.compile(r'^(\s*[-*]\s*\[)[ xX](\])', re.M)
+
+
+def _normalize_progress(text:str)->str:
+    """把 markdown 勾選框正規化成未勾選。
+
+    為什麼批准 digest 要排除勾選狀態：`tasks.md` 與 `workflow/test-cases/<change>.md`
+    的 `[x]` 是**進度**，在 ENGINEERING 期間本來就會被更新。把它算進 digest 會讓
+    每打一個勾就撤銷一次人類批准 —— 那不是收緊，是把 gate 變成噪音來源，
+    使用者會學會繞過它。
+
+    反過來說，**任務與案例的文字**是被批准內容的一部分，不得改動。
+    GATES.md 已經寫明勾選不是 gate 憑證；這裡是同一條規則的實作面。
+    """
+    return PROGRESS_LINE_RE.sub(r'\1 \2', text)
+
+
+def _tree_digest(root:Path, rel_paths):
+    """對一組檔案產生與路徑順序無關的 deterministic digest。
+
+    綁 worktree 內容而非 git object：被批准的是人類在 TTY 當下看到的那份文字，
+    而那份文字在磁碟上。缺檔與空檔必須可區分，否則刪掉檔案就等於通過。
+    """
+    h = hashlib.sha256()
+    for rel in sorted(rel_paths):
+        h.update(rel.encode()+b'\0')
+        q = root/rel
+        try:
+            raw = q.read_bytes()
+        except OSError:
+            h.update(b'<absent>\0'); continue
+        text = raw.decode('utf-8', errors='replace').replace('\r\n','\n')
+        h.update(hashlib.sha256(_normalize_progress(text).encode()).hexdigest().encode()+b'\0')
+    return h.hexdigest()
+
+
+def spec_digest(root:Path, change:str):
+    """active OpenSpec change 的完整內容 digest。change 不合法或目錄不存在時回 None。"""
+    if not change or change=='none' or validate_change_id(change): return None
+    d = root/'openspec/changes'/change
+    if not d.is_dir(): return None
+    rels=[]
+    for q in d.rglob('*'):
+        if q.is_file():
+            rels.append(q.relative_to(root).as_posix())
+    if not rels: return None
+    return _tree_digest(root, rels)
+
+
+def test_design_digest(root:Path, change:str):
+    """test-design artifact 的 digest。找不到時回 None（呼叫端 fail-closed）。"""
+    if not change or change=='none' or validate_change_id(change): return None
+    p = root/'workflow/test-cases'/f'{change}.md'
+    if not p.is_file(): return None
+    return _tree_digest(root, [p.relative_to(root).as_posix()])
+
+
+def approved_content_status(root:Path, state):
+    """批准內容（profile + spec + test design）是否仍與人類批准的一致。回傳 (ok, reason)。
+
+    profile 那一半見 approved_profile_status。這裡補上更核心的兩份 ——
+    `Spec approved: yes` 與 `Test design approved: yes` 原本是**裸旗標**，而
+    `openspec/**` 與 `workflow/test-cases/**` 都永久列在 AI-writable allowlist 裡。
+    實測繞過：批准 Spec A（「只做 X，絕不碰付款」）並進入 ENGINEERING 後，把
+    proposal 換成 Spec B（「直接對外開放付款 API，不做驗證」）、test design 一併換掉，
+    產品 commit 照樣放行，STATE 仍顯示兩者已批准。fresh clone 看到的是「已批准」，
+    而實際內容從未被任何人批准。
+
+    這與 profile 是同一個病：**批准綁旗標而不綁內容**。
+    """
+    ok, why = approved_profile_status(root, state)
+    if not ok: return ok, why
+    if state.spec_approved=='yes':
+        if state.spec_digest=='none':
+            return False, ('STATE 沒有記錄批准時的 OpenSpec change digest。\n'
+                           '  這份 STATE 早於該欄位存在，或批准流程未完成 —— 無法證明現在的\n'
+                           '  spec 就是人類批准過的那一份。請重新執行 approve-spec。')
+        cur = spec_digest(root, state.active_change)
+        if cur is None:
+            return False, (f'找不到可計算 digest 的 OpenSpec change：{state.active_change}\n'
+                           '  被批准的 spec 內容已不存在。')
+        if cur != state.spec_digest:
+            return False, ('OpenSpec change 的內容與人類批准的不一致。\n'
+                           f'  批准時 digest: {state.spec_digest[:16]}\n'
+                           f'  目前 digest:   {cur[:16]}\n'
+                           '  勾選狀態不計入 digest —— 會觸發這條的是**任務或規格文字**改動。\n'
+                           '  spec 要改，必須回 SPECIFICATION 重新 review。')
+    if state.test_design_approved=='yes':
+        if state.test_design_digest=='none':
+            return False, ('STATE 沒有記錄批准時的 test design digest。\n'
+                           '  請重新執行 approve-tests。')
+        cur = test_design_digest(root, state.active_change)
+        if cur is None:
+            return False, (f'找不到 test design artifact：'
+                           f'workflow/test-cases/{state.active_change}.md')
+        if cur != state.test_design_digest:
+            return False, ('Test design 的內容與人類批准的不一致。\n'
+                           f'  批准時 digest: {state.test_design_digest[:16]}\n'
+                           f'  目前 digest:   {cur[:16]}\n'
+                           '  勾選狀態不計入 digest —— 會觸發這條的是**案例文字**改動。')
+    return True, ''
 
 
 def approved_profile_status(root:Path, state):
@@ -1166,7 +1320,7 @@ def implementation_authorized(root:Path, state):
     """
     if not state.implementation_allowed:
         return False, 'Derived Implementation allowed=no'
-    return approved_profile_status(root, state)
+    return approved_content_status(root, state)
 
 
 PROVENANCE_INFO='INFO'

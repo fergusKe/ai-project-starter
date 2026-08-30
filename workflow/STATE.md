@@ -10,4 +10,6 @@ Test design approved: no
 Verification passed: no
 Approved by: none
 Approved profile digest: none
+Approved spec digest: none
+Approved test design digest: none
 Last updated: none

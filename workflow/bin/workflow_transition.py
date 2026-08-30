@@ -8,7 +8,8 @@ from workflow_state import (parse_state,write_state,state_hash_path,now_iso,proj
  installation_conflicts,installation_overwrites,installation_preflight,installation_unexpected_changes,staged_state_is_pristine,
  repository_enforcement,enforcement_is_active,GATE_BRIDGE_COMMAND,verification_policy,
  probe_enforcement,probe_head_enforcement,effective_pre_commit_hook,
- probe_fingerprint,finalize_probe_receipt,approved_profile_status,
+ probe_fingerprint,finalize_probe_receipt,approved_profile_status,approved_content_status,
+ spec_digest,test_design_digest,critical_journeys,
  ENFORCEMENT_CHAINED_STATIC,profile_resolution,agent_environment_provenance,validate_change_id)
 ROOT=Path(__file__).resolve().parents[2];STATE=ROOT/'workflow/STATE.md';LOG=ROOT/'workflow/state-log.md'
 CORE_NAME_RE=re.compile(r'^\d{8}T\d{6}(?:\d{6})?Z\.md$')
@@ -216,6 +217,22 @@ def validate_browser(change):
  if not_app:die('Web 專案不可使用 NOT APPLICABLE',49)
  mcore=re.search(r'^Core evidence:\s*(\S+)\s*$',t,re.M);mreport=re.search(r'^Playwright report:\s*(\S+)\s*$',t,re.M)
  if not mcore or not mreport or 'Chrome DevTools' not in t:die('Web browser evidence 缺少 Core evidence / Playwright report / Chrome DevTools',49)
+ # 每個被批准的 journey 都必須有明確結果。SHA-256 只證明「這份文字沒被換掉」，
+ # 不證明它**覆蓋了被批准的範圍** —— 少了這一條，一份只驗首頁的 evidence
+ # 可以替一個批准了「結帳、付款」的 profile 收尾。
+ # 能力邊界：這驗證的是**宣稱**，不是那些 journey 真的被執行過。
+ journeys=critical_journeys(ROOT)
+ if not journeys:die('WEB 專案必須在 PROJECT-PROFILE 以 `- [J1] 描述` 列出 critical user journeys',49)
+ missing=[];failed=[]
+ for jid,desc in journeys:
+  m=re.search(rf'^{re.escape(jid)}:[ \t]*(\S+)',t,re.M)
+  if not m:missing.append(f'{jid}（{desc}）');continue
+  if m.group(1).upper()!='PASS':failed.append(f'{jid}: {m.group(1)}')
+ if missing:
+  die('browser evidence 沒有涵蓋下列已批准的 critical journey：\n  - '+'\n  - '.join(missing)
+      +'\n每個 journey 需要一行 `J<n>: PASS`。',49)
+ if failed:
+  die('下列 critical journey 未通過：\n  - '+'\n  - '.join(failed),49)
  cp=edir(change)/'core'/Path(mcore.group(1)).name
  if not CORE_NAME_RE.fullmatch(cp.name) or not cp.exists() or not core_success(cp):die('browser.md 引用的 core evidence 無效或未通過',55)
  report=(ROOT/mreport.group(1)).resolve()
@@ -260,8 +277,26 @@ def cmd_set_mode(a):
  transition(s,replace(s,project_mode=a.mode,last_updated=now_iso()),'set-mode','machine-verified',f'Project mode={a.mode}')
 def cmd_start_change(a):
  s=parse_state(STATE)
- if s.phase not in {'DISCOVERY','SPECIFICATION'}:die('start-change 只允許 DISCOVERY/SPECIFICATION',34)
- ensure_change_exists(a.change);ns=replace(s,phase='SPECIFICATION',active_change=a.change,spec_approved='no',test_design_approved='no',verification_passed='no',approved_by='none',last_updated=now_iso());transition(s,ns,'start-change','machine-verified','Active change bound')
+ # ARCHIVE 必須是合法起點。AGENTS.md 明寫「ARCHIVE 後必須開新 change」，而
+ # revert-to-spec 拒絕 ARCHIVE 時也叫使用者「請建立新的 OpenSpec change」——
+ # 但在此之前 start-change 只接受 DISCOVERY/SPECIFICATION，等於整個 Starter
+ # 做完第一個 change 之後就沒有第二輪入口。這不是安全漏洞，是工具不能用；
+ # 十三輪對抗審查都沒發現，因為大家（包括 G4 冷啟動）都停在 SPEC_REVIEW 之前。
+ if s.phase not in {'DISCOVERY','SPECIFICATION','ARCHIVE'}:
+  die('start-change 只允許 DISCOVERY/SPECIFICATION/ARCHIVE',34)
+ ensure_change_exists(a.change)
+ if s.phase=='ARCHIVE' and a.change==s.active_change:
+  # 沿用同一個 change 名會讓新一輪的 evidence 寫進已封存那一輪的目錄，
+  # 而 state-log 的兩筆 verification-pass 記錄會指向同一條路徑。
+  die(f'change 名稱與剛封存的那一個相同：{a.change}\n'
+      '  請為新的一輪使用不同的 change 名，避免 evidence 與稽核紀錄互相覆蓋。',34)
+ # 新的一輪必須從零開始批准。**所有** approval flag 與被批准內容的 digest 都要清掉——
+ # 少清一個就等於讓新 change 繼承上一輪人類的批准。project mode 是 repository 屬性，保留。
+ ns=replace(s,phase='SPECIFICATION',active_change=a.change,
+            spec_approved='no',test_design_approved='no',verification_passed='no',
+            approved_by='none',profile_digest='none',spec_digest='none',
+            test_design_digest='none',last_updated=now_iso())
+ transition(s,ns,'start-change','machine-verified','Active change bound')
 def cmd_submit(a):
  s=parse_state(STATE)
  if s.phase!='SPECIFICATION':die('submit-for-review 只允許 SPECIFICATION',35)
@@ -288,7 +323,12 @@ def cmd_approve_spec(a):
   die('PROJECT-PROFILE.md 有無法辨識的值：\n'
       +''.join(f'  - {n}: {v!r} —— {why}\n' for n,v,why in invalid)
       +'打錯字不會被當成未決，會被當成已決定 —— 而錯的值可能靜默關掉某個 Gate。',44)
- details='即將定案的 PROJECT-PROFILE：\n'+''.join(f'  {k}: {resolved[k]}\n' for k in sorted(resolved))
+ sdg=spec_digest(ROOT,a.change)
+ if sdg is None:die(f'無法計算 OpenSpec change 的 digest：openspec/changes/{a.change}',44)
+ details=('即將定案的 PROJECT-PROFILE：\n'
+          +''.join(f'  {k}: {resolved[k]}\n' for k in sorted(resolved))
+          +f'即將批准的 OpenSpec change 內容 digest: {sdg[:16]}\n'
+          '  （勾選狀態不計入；改動任務或規格文字會使批准失效）\n')
  actor=tty_human_confirm('approve-spec',a.change,details)
  # TTY 是人類速度的等待，視窗以分鐘計。回來之後必須重新比對：人類批准的是畫面上
  # 那份 profile，不是「他打完字時磁碟上剛好是什麼」。沒有這一步，另一個 process
@@ -297,17 +337,31 @@ def cmd_approve_spec(a):
  if after!=digest:
   die('PROJECT-PROFILE.md 在你確認期間被修改，批准作廢。\n'
       '  你看到並批准的是修改前的內容；請重新檢視後再執行一次 approve-spec。',44)
+ if spec_digest(ROOT,a.change)!=sdg:
+  die('OpenSpec change 的內容在你確認期間被修改，批准作廢。\n'
+      '  你看到並批准的是修改前的內容；請重新檢視後再執行一次 approve-spec。',44)
  transition(s,replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by=actor,
-                      profile_digest=digest,last_updated=now_iso()),
-            'approve-spec',actor,f'Human approved specification; profile digest {digest[:16]}')
+                      profile_digest=digest,spec_digest=sdg,last_updated=now_iso()),
+            'approve-spec',actor,
+            f'Human approved specification; profile digest {digest[:16]}; spec digest {sdg[:16]}')
 def cmd_approve_tests(a):
  s=parse_state(STATE)
  if s.phase!='TEST_DESIGN':die('approve-tests 只允許 TEST_DESIGN',42)
  if s.spec_approved!='yes':die('Spec 尚未批准',43)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
- ok,why=approved_profile_status(ROOT,s)
- if not ok:die(f'approve-tests 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
- actor=tty_human_confirm('approve-tests',a.change);transition(s,replace(s,test_design_approved='yes',approved_by=actor,last_updated=now_iso()),'approve-tests',actor,'Human approved test design')
+ ok,why=approved_content_status(ROOT,s)
+ if not ok:die(f'approve-tests 需要已批准的內容仍然一致。\n{why}',44)
+ tdg=test_design_digest(ROOT,a.change)
+ if tdg is None:die(f'找不到 test design artifact：workflow/test-cases/{a.change}.md',44)
+ details=(f'即將批准的 test design digest: {tdg[:16]}\n'
+          f'  檔案：workflow/test-cases/{a.change}.md\n'
+          '  （勾選狀態不計入；改動案例文字會使批准失效）\n')
+ actor=tty_human_confirm('approve-tests',a.change,details)
+ if test_design_digest(ROOT,a.change)!=tdg:
+  die('Test design 在你確認期間被修改，批准作廢；請重新檢視後再執行一次 approve-tests。',44)
+ transition(s,replace(s,test_design_approved='yes',approved_by=actor,
+                      test_design_digest=tdg,last_updated=now_iso()),
+            'approve-tests',actor,f'Human approved test design; digest {tdg[:16]}')
 def cmd_start_engineering(a):
  s=parse_state(STATE)
  if s.phase!='TEST_DESIGN':die('start-engineering 只允許 TEST_DESIGN',44)
@@ -316,7 +370,7 @@ def cmd_start_engineering(a):
  # 只看 approval flag 不夠。approve-spec 與 start-engineering 之間可以隔任意長的
  # 時間與任意多的 agent 動作；把 `Core verification policy` 改成 not-applicable
  # 這種放寬，在只檢查 flag 的設計下不會被任何人發現。批准綁的是**內容**，不是旗標。
- ok,why=approved_profile_status(ROOT,s)
+ ok,why=approved_content_status(ROOT,s)
  if not ok:die(why,44)
  transition(s,replace(s,phase='ENGINEERING',last_updated=now_iso()),'start-engineering','machine-verified','Approval prerequisites satisfied; profile digest re-verified')
 def cmd_verification_pass(a):
@@ -326,8 +380,8 @@ def cmd_verification_pass(a):
  # 必須在跑 verify.sh **之前**擋。verify.sh 會依當下的 PROJECT-PROFILE 決定要不要
  # 執行檢查；profile 若已被換成未經批准的 not-applicable，它會產生一份
  # `Checks executed: 0` 的 evidence，事後把檔案 restore 回去 git 就看不到任何痕跡。
- ok,why=approved_profile_status(ROOT,s)
- if not ok:die(f'verification-pass 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
+ ok,why=approved_content_status(ROOT,s)
+ if not ok:die(f'verification-pass 需要已批准的內容仍然一致。\n{why}',44)
  # 由 verify.sh 明確回報它建立的路徑，不用「前後檔名集合差」——
  # 後者在同一微秒檔名碰撞（覆寫舊檔）時會得到 0 份，並行執行時會得到多份。
  r=subprocess.run(['bash',str(ROOT/'workflow/bin/verify.sh'),'--full'],cwd=ROOT,capture_output=True,text=True)
@@ -366,8 +420,8 @@ def cmd_archive(a):
  s=parse_state(STATE)
  if s.phase!='VERIFICATION' or s.verification_passed!='yes':die('archive 需要 VERIFICATION 且 Verification passed=yes',50)
  if s.active_change!=a.change:die('change 與 STATE 不一致',41)
- ok,why=approved_profile_status(ROOT,s)
- if not ok:die(f'archive 需要 PROJECT-PROFILE 與人類批准的內容一致。\n{why}',44)
+ ok,why=approved_content_status(ROOT,s)
+ if not ok:die(f'archive 需要已批准的內容仍然一致。\n{why}',44)
  accepted=_accepted_evidence_from_log(a.change)
  if accepted is None:die('state-log 找不到 verification-pass 所接受的 core evidence 記錄；請重跑 verification-pass',51)
  rel,expected,expected_browser=accepted

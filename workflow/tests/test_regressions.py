@@ -38,13 +38,41 @@ def stamp_approved_profile(r):
     try:
         import workflow_state as _W
         importlib.reload(_W)
-        _,inv,_,dg=_W.profile_resolution(r)
-        assert not inv and dg, f'fixture 的 profile 必須完全解析：{inv}'
+        # WEB 專案必須定義 critical journeys（決定 Browser Verification 範圍，
+        # 並納入被批准的 digest）。fixture 若把 Type 設成 WEB_APP 卻不定義 journeys，
+        # profile 就解析不完全。
+        if _W.project_web_status(r)=='WEB' and not _W.critical_journeys(r):
+            txt=pp.read_text(encoding='utf-8')
+            pp.write_text(txt.replace('## Critical user journeys\n- 尚未定義',
+                                      '## Critical user journeys\n- [J1] 主要流程可完成'),
+                          encoding='utf-8')
+        unres,inv,_,dg=_W.profile_resolution(r)
+        assert not inv and dg, f'fixture 的 profile 必須完全解析：未解析={unres} 非法={inv}'
         st=r/'workflow/STATE.md'; s=st.read_text(encoding='utf-8')
-        if 'Approved profile digest:' in s:
-            s=_re.sub(r'^Approved profile digest:.*$',f'Approved profile digest: {dg}',s,flags=_re.M)
-        else:
-            s=s.replace('Last updated:',f'Approved profile digest: {dg}\nLast updated:',1)
+        # spec / test design 的 digest 也要一起蓋。fixture 若只蓋 profile，
+        # 模擬出來的是一個真實流程不會產生的狀態：`Spec approved: yes` 卻沒有
+        # 對應的被批准內容 digest。
+        chg=_re.search(r'^Active OpenSpec change:[ \t]*(.*?)[ \t]*$',s,_re.M)
+        chg=chg.group(1) if chg else 'none'
+        # 宣稱批准了什麼，那個東西就得存在。fixture 說 `Test design approved: yes`
+        # 卻沒有 artifact 的話，模擬的是一個真實流程產生不出來的狀態。
+        if chg not in ('none',''):
+            d=r/'openspec/changes'/chg
+            if not d.is_dir():
+                d.mkdir(parents=True,exist_ok=True)
+                (d/'proposal.md').write_text('# Proposal\n',encoding='utf-8')
+            tc=r/'workflow/test-cases'/f'{chg}.md'
+            if not tc.is_file():
+                tc.parent.mkdir(parents=True,exist_ok=True)
+                tc.write_text('# Test Design\n- [ ] 案例\n',encoding='utf-8')
+        sdg=_W.spec_digest(r,chg) or 'none'
+        tdg=_W.test_design_digest(r,chg) or 'none'
+        for key,val in (('Approved profile digest',dg),('Approved spec digest',sdg),
+                        ('Approved test design digest',tdg)):
+            if f'{key}:' in s:
+                s=_re.sub(rf'^{_re.escape(key)}:.*$',f'{key}: {val}',s,flags=_re.M)
+            else:
+                s=s.replace('Last updated:',f'{key}: {val}\nLast updated:',1)
         st.write_text(s,encoding='utf-8')
     finally:
         _sys.path.remove(str(r/'workflow/bin'))
@@ -2897,6 +2925,9 @@ class RC5Round12Tests(unittest.TestCase):
             self._resolve_profile(r)
             d=r/'openspec/changes/demo'; d.mkdir(parents=True)
             (d/'proposal.md').write_text('x',encoding='utf-8')
+            # STATE 宣稱 test design 已批准，artifact 就必須存在。
+            tc=r/'workflow/test-cases'; tc.mkdir(parents=True,exist_ok=True)
+            (tc/'demo.md').write_text('# Test Design\n- [ ] 案例\n',encoding='utf-8')
             sys.path.insert(0,str(r/'workflow/bin'))
             try:
                 import importlib, workflow_state as W
@@ -2904,7 +2935,9 @@ class RC5Round12Tests(unittest.TestCase):
                 _,_,_,dg=W.profile_resolution(r)
                 W.write_state(r/'workflow/STATE.md',
                               W.WorkflowState('TEST_DESIGN','GREENFIELD','demo','yes','yes','no',
-                                              'human',W.now_iso(),dg))
+                                              'human',W.now_iso(),dg,
+                                              W.spec_digest(r,'demo') or 'none',
+                                              W.test_design_digest(r,'demo') or 'none'))
                 ok=self._run(r,'start-engineering','demo')
                 self.assertEqual(ok.returncode,0,'前提：未改動時應該通過\n'+ok.stdout+ok.stderr)
                 s=W.parse_state(r/'workflow/STATE.md')
@@ -2931,7 +2964,9 @@ class RC5Round12Tests(unittest.TestCase):
                 importlib.reload(W)
                 W.write_state(r/'workflow/STATE.md',
                               W.WorkflowState('TEST_DESIGN','GREENFIELD','demo','yes','yes','no',
-                                              'human',W.now_iso()))
+                                              'human',W.now_iso(),'none',
+                                              W.spec_digest(r,'demo') or 'none',
+                                              W.test_design_digest(r,'demo') or 'none'))
                 p=r/'workflow/STATE.md'
                 p.write_text(re.sub(r'^Approved profile digest:.*\n','',
                                     p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
@@ -3110,7 +3145,9 @@ class RC5Round13Tests(unittest.TestCase):
             self.assertIsNotNone(dg,'前提：profile 必須完全解析')
             W.write_state(r/'workflow/STATE.md',
                           W.WorkflowState('ENGINEERING','GREENFIELD','demo','yes','yes','no',
-                                          'human',W.now_iso(),dg))
+                                          'human',W.now_iso(),dg,
+                                          W.spec_digest(r,'demo') or 'none',
+                                          W.test_design_digest(r,'demo') or 'none'))
         finally: sys.path.remove(str(r/'workflow/bin'))
         subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
         subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','approved'],
@@ -3368,6 +3405,332 @@ class RC5Round13Tests(unittest.TestCase):
             a=self._run(r,'archive','demo')
             self.assertEqual(a.returncode,0,a.stdout+a.stderr)
             self.assertIn('Phase: ARCHIVE',(r/'workflow/STATE.md').read_text(encoding='utf-8'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+
+
+class RC5Round15Tests(unittest.TestCase):
+    """Codex 第十四輪的三個 blocker + 一個完整性問題。
+
+    共同主題：**批准綁的是內容不是旗標**（第十三輪對 profile 修過一次，
+    但更核心的 spec / test design 仍是裸旗標），以及**生命週期沒有第二輪**。
+    """
+
+    def _repo(self):
+        td=Path(tempfile.mkdtemp(prefix='rc5r15-')); r=td/'repo'; r.mkdir()
+        for rel in OWNED:
+            src=SRC/rel
+            if not src.exists(): continue
+            dst=r/rel
+            if src.is_dir():
+                shutil.copytree(src,dst,dirs_exist_ok=True,ignore=shutil.ignore_patterns('__pycache__','*.pyc','node_modules','dist','build','.next','venv','.venv','coverage','playwright-report','test-results'))
+            else:
+                dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+        (r/'.githooks/pre-commit').chmod(0o755)
+        for c in (['git','init','-b','main'],['git','config','user.email','a@example.invalid'],
+                  ['git','config','user.name','A']):
+            subprocess.run(c,cwd=r,check=True,capture_output=True)
+        return td,r
+
+    def _run(self,r,*args):
+        return subprocess.run(['python3','workflow/bin/workflow_transition.py',*args],
+                              cwd=r,capture_output=True,text=True)
+
+    def _set_profile(self,r,**kv):
+        p=r/'PROJECT-PROFILE.md'; t=p.read_text(encoding='utf-8')
+        for k,v in kv.items():
+            k=k.replace('_',' ')
+            t=re.sub(rf'^{re.escape(k)}:[ \t]*.*$',f'{k}: {v}',t,count=1,flags=re.M)
+        p.write_text(t,encoding='utf-8')
+
+    def _engineering(self,r,change='demo'):
+        """已批准 profile/spec/test-design 且位於 ENGINEERING 的合法狀態。"""
+        self._set_profile(r,Type='API',Web_verification_required='no',
+                          Primary_stack='Python 3.12',Package_manager='uv',Monorepo='no',
+                          CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+        d=r/'openspec/changes'/change; d.mkdir(parents=True,exist_ok=True)
+        (d/'proposal.md').write_text('# Spec A\n只做 X，絕不碰付款。\n',encoding='utf-8')
+        (d/'tasks.md').write_text('# Tasks\n- [ ] 實作 X\n',encoding='utf-8')
+        tc=r/'workflow/test-cases'; tc.mkdir(parents=True,exist_ok=True)
+        (tc/f'{change}.md').write_text('# Test Design A\n- [ ] 驗證 X\n',encoding='utf-8')
+        (r/'package.json').write_text(json.dumps({"scripts":{"test":"echo ok","build":"echo b"}}),
+                                      encoding='utf-8')
+        sys.path.insert(0,str(r/'workflow/bin'))
+        try:
+            import workflow_state as W
+            importlib.reload(W)
+            _,_,_,dg=W.profile_resolution(r)
+            W.write_state(r/'workflow/STATE.md',
+                          W.WorkflowState('ENGINEERING','GREENFIELD',change,'yes','yes','no',
+                                          'human',W.now_iso(),dg,
+                                          W.spec_digest(r,change),W.test_design_digest(r,change)))
+        finally: sys.path.remove(str(r/'workflow/bin'))
+        subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+        subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','approved'],
+                       cwd=r,check=True,capture_output=True)
+
+    def _gate(self,r):
+        return subprocess.run(['python3','workflow/bin/check-implementation-gate.py','--staged'],
+                              cwd=r,capture_output=True,text=True)
+
+    # ---- Blocker 1：spec / test design 綁內容 ---------------------------------
+
+    def test_spec_swap_after_approval_blocks_product_commits(self):
+        """批准 Spec A 之後換成 Spec B —— 一般 commit 原本會放行，STATE 仍顯示已批准。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            ok=self._gate(r)
+            self.assertEqual(ok.returncode,0,'前提：未改動時產品 commit 應放行\n'+ok.stdout+ok.stderr)
+            (r/'openspec/changes/demo/proposal.md').write_text(
+                '# Spec B\n直接對外開放付款 API，不做驗證。\n',encoding='utf-8')
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('OpenSpec change 的內容與人類批准的不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_test_design_swap_after_approval_blocks_product_commits(self):
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            (r/'workflow/test-cases/demo.md').write_text('# Test Design B\n- [ ] 不用測\n',
+                                                         encoding='utf-8')
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('Test design 的內容與人類批准的不一致',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_progress_checkboxes_do_not_invalidate_approval(self):
+        """**對照組，而且是設計的一部分。**
+
+        `tasks.md` 與 test-cases 的 `[x]` 是進度，在 ENGINEERING 期間本來就會更新。
+        把它算進 digest 會讓每打一個勾就撤銷一次人類批准 —— 那不是收緊，
+        是把 gate 變成噪音來源，使用者會學會繞過它。
+        """
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            (r/'openspec/changes/demo/tasks.md').write_text('# Tasks\n- [x] 實作 X\n',encoding='utf-8')
+            (r/'workflow/test-cases/demo.md').write_text('# Test Design A\n- [x] 驗證 X\n',
+                                                         encoding='utf-8')
+            x=self._gate(r)
+            self.assertEqual(x.returncode,0,'打勾是進度，不得撤銷批准\n'+x.stdout+x.stderr)
+            # 但**文字**改動仍必須被擋
+            (r/'openspec/changes/demo/tasks.md').write_text('# Tasks\n- [x] 改成做 Y\n',
+                                                            encoding='utf-8')
+            y=self._gate(r)
+            self.assertNotEqual(y.returncode,0,'任務文字改動必須被擋\n'+y.stdout+y.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_deleting_approved_spec_is_not_a_bypass(self):
+        """刪檔不得等於通過。digest 必須能區分「缺檔」與「空檔」。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            (r/'app.py').write_text('print(1)\n',encoding='utf-8')
+            subprocess.run(['git','add','app.py'],cwd=r,check=True,capture_output=True)
+            (r/'openspec/changes/demo/proposal.md').unlink()
+            x=self._gate(r)
+            self.assertNotEqual(x.returncode,0,x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 3：ARCHIVE 之後必須能開下一個 change --------------------------
+
+    def test_archive_is_a_legal_start_point_for_the_next_change(self):
+        """**這不是安全漏洞，是工具不能用。**
+
+        AGENTS.md 明寫「ARCHIVE 後必須開新 change」，revert-to-spec 拒絕 ARCHIVE 時
+        也叫使用者「請建立新的 OpenSpec change」—— 但 start-change 原本只接受
+        DISCOVERY/SPECIFICATION，等於做完第一個 change 之後就沒有第二輪入口。
+        十三輪對抗審查沒發現，因為大家都停在 SPEC_REVIEW 之前。
+        """
+        td,r=self._repo()
+        try:
+            self._engineering(r,'first-change')
+            p=r/'workflow/STATE.md'
+            p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
+                                p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            nxt=r/'openspec/changes/second-change'; nxt.mkdir(parents=True)
+            (nxt/'proposal.md').write_text('x',encoding='utf-8')
+            x=self._run(r,'start-change','second-change')
+            self.assertEqual(x.returncode,0,'ARCHIVE 必須是合法起點\n'+x.stdout+x.stderr)
+            state=p.read_text(encoding='utf-8')
+            self.assertIn('Phase: SPECIFICATION',state,state)
+            self.assertIn('Active OpenSpec change: second-change',state,state)
+            self.assertIn('Project mode: GREENFIELD',state,'project mode 是 repository 屬性，應保留')
+            for field in ('Spec approved: no','Test design approved: no','Verification passed: no',
+                          'Approved by: none','Approved profile digest: none',
+                          'Approved spec digest: none','Approved test design digest: none'):
+                self.assertIn(field,state,
+                              f'新的一輪必須從零開始批准；少清一個就等於繼承上一輪的批准：缺 {field}\n'+state)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_next_change_cannot_reuse_the_archived_change_name(self):
+        """沿用同名會讓新一輪的 evidence 寫進已封存那一輪的目錄。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r,'demo')
+            p=r/'workflow/STATE.md'
+            p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
+                                p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            x=self._run(r,'start-change','demo')
+            out=x.stdout+x.stderr
+            self.assertEqual(x.returncode,34,out)
+            self.assertIn('與剛封存的那一個相同',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- 完整性：ARCHIVE 之後 evidence 凍結 -----------------------------------
+
+    def test_archived_evidence_is_frozen(self):
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            ev=r/'workflow/evidence/demo/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# ev\n',encoding='utf-8')
+            (r/'workflow/evidence/demo/browser.md').write_text('# browser\n',encoding='utf-8')
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            subprocess.run(['git','-c','core.hooksPath=/dev/null','commit','-m','ev'],
+                           cwd=r,check=True,capture_output=True)
+            p=r/'workflow/STATE.md'
+            p.write_text(re.sub(r'^Phase:.*$','Phase: ARCHIVE',
+                                p.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            (ev/'20260101T000000Z.md').write_text('# tampered\n',encoding='utf-8')
+            subprocess.run(['git','add','workflow/evidence'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            out=x.stdout+x.stderr
+            self.assertNotEqual(x.returncode,0,out)
+            self.assertIn('不得修改已封存的 evidence',out,out)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_evidence_is_writable_before_archive(self):
+        """對照組：凍結只在 ARCHIVE 生效，否則 verification-pass 自己就寫不了 evidence。"""
+        td,r=self._repo()
+        try:
+            self._engineering(r)
+            ev=r/'workflow/evidence/demo/core'; ev.mkdir(parents=True)
+            (ev/'20260101T000000Z.md').write_text('# ev\n',encoding='utf-8')
+            subprocess.run(['git','add','-A'],cwd=r,check=True,capture_output=True)
+            x=self._gate(r)
+            self.assertEqual(x.returncode,0,'ENGINEERING 階段 evidence 必須可寫\n'+x.stdout+x.stderr)
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    # ---- Blocker 2：critical journeys ----------------------------------------
+
+    def test_journeys_are_part_of_the_approved_profile_digest(self):
+        """批准含「結帳、付款」的 profile 後改成「首頁」，digest 原本完全不變。"""
+        td,r=self._repo()
+        try:
+            self._set_profile(r,Type='WEB_APP',Web_verification_required='yes',
+                              Primary_stack='Next.js',Package_manager='pnpm',Monorepo='no',
+                              CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+            pp=r/'PROJECT-PROFILE.md'
+            pp.write_text(pp.read_text(encoding='utf-8').replace(
+                '## Critical user journeys\n- 尚未定義',
+                '## Critical user journeys\n- [J1] 使用者可完成結帳與付款'),encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                _,_,_,before=W.profile_resolution(r)
+                self.assertIsNotNone(before,'WEB 專案定義 journeys 之後應可解析')
+                pp.write_text(pp.read_text(encoding='utf-8').replace(
+                    '- [J1] 使用者可完成結帳與付款','- [J1] 首頁可載入'),encoding='utf-8')
+                _,_,_,after=W.profile_resolution(r)
+                self.assertNotEqual(before,after,'改動 journeys 必須改變 digest')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_web_project_without_journeys_is_unresolved(self):
+        td,r=self._repo()
+        try:
+            self._set_profile(r,Type='WEB_APP',Web_verification_required='yes',
+                              Primary_stack='Next.js',Package_manager='pnpm',Monorepo='no',
+                              CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                unres,_,_,dg=W.profile_resolution(r)
+                self.assertIsNone(dg,'WEB 專案沒有 journeys 不得產生 digest')
+                self.assertTrue(any('journey' in u.lower() for u in unres),unres)
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_example_journeys_in_html_comment_are_not_parsed(self):
+        """PROJECT-PROFILE 用 HTML 註解放範例；不剝掉的話全新 profile 會憑空「已定義」。"""
+        td,r=self._repo()
+        try:
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import workflow_state as W
+                importlib.reload(W)
+                self.assertEqual(W.critical_journeys(r),[],
+                                 '註解裡的範例不得被當成真的 journey')
+            finally: sys.path.remove(str(r/'workflow/bin'))
+        finally: shutil.rmtree(td,ignore_errors=True)
+
+    def test_browser_evidence_must_cover_every_approved_journey(self):
+        """SHA-256 只證明「文字沒被換掉」，不證明它覆蓋了被批准的範圍。"""
+        td,r=self._repo()
+        try:
+            self._set_profile(r,Type='WEB_APP',Web_verification_required='yes',
+                              Primary_stack='Next.js',Package_manager='pnpm',Monorepo='no',
+                              CI_provider='GitHub Actions',Test_database_strategy='not-applicable')
+            pp=r/'PROJECT-PROFILE.md'
+            pp.write_text(pp.read_text(encoding='utf-8').replace(
+                '## Critical user journeys\n- 尚未定義',
+                '## Critical user journeys\n- [J1] 結帳\n- [J2] 付款'),encoding='utf-8')
+            st=r/'workflow/STATE.md'
+            st.write_text(re.sub(r'^Active OpenSpec change:.*$','Active OpenSpec change: demo',
+                                 st.read_text(encoding='utf-8'),flags=re.M),encoding='utf-8')
+            # core evidence 現在要自證來歷，否則 validate_browser 會先在
+            # 「引用的 core evidence 未通過」失敗，測不到 journey 覆蓋這一層。
+            dg=stamp_approved_profile(r)
+            ed=r/'workflow/evidence/demo'; (ed/'core').mkdir(parents=True)
+            core=ed/'core/20260101T000000Z.md'
+            core.write_text('# ev\nCore evidence schema: 2\nChange: demo\n'
+                            'Verification policy: auto\n'
+                            f'Approved profile digest: {dg}\n'
+                            'Checks selected: 1\nChecks executed: 1\n'
+                            'Exit code: 0\nOutcome: PASS\nOverall exit code: 0\n',encoding='utf-8')
+            rep=r/'playwright-report'; rep.mkdir(); (rep/'index.html').write_text('r',encoding='utf-8')
+            def browser(body):
+                (ed/'browser.md').write_text(
+                    f'# Browser Verification Evidence\nCore evidence: {core.name}\n'
+                    'Playwright report: playwright-report/index.html\n'
+                    'Chrome DevTools MCP: checked\n'+body,encoding='utf-8')
+            sys.path.insert(0,str(r/'workflow/bin'))
+            try:
+                import importlib.util as _iu
+                spec=_iu.spec_from_file_location('wt_j',r/'workflow/bin/workflow_transition.py')
+                m=_iu.module_from_spec(spec); sys.modules['wt_j']=m; spec.loader.exec_module(m)
+                browser('J1: PASS\n')
+                with self.assertRaises(SystemExit) as cm: m.validate_browser('demo')
+                self.assertEqual(cm.exception.code,49)
+                browser('J1: PASS\nJ2: FAIL\n')
+                with self.assertRaises(SystemExit) as cm: m.validate_browser('demo')
+                self.assertEqual(cm.exception.code,49)
+                browser('J1: PASS\nJ2: PASS\n')
+                m.validate_browser('demo')   # 不得拋出
+
+                # **隔離測試**：validate_browser 自己那一道「WEB 專案必須定義
+                # journeys」在正常流程裡到不了（profile_resolution 更早就擋了），
+                # 所以突變它整組測試照樣綠。它不是獨立安全層，但在自己那一層提供
+                # 明確訊息；鎖的是訊息，不是擋不擋。同 `profile_digest == none` 的處理。
+                pp.write_text(pp.read_text(encoding='utf-8').replace(
+                    '- [J1] 結帳\n- [J2] 付款','- 尚未定義'),encoding='utf-8')
+                with self.assertRaises(SystemExit) as cm: m.validate_browser('demo')
+                self.assertEqual(cm.exception.code,49)
+            finally:
+                sys.path.remove(str(r/'workflow/bin')); sys.modules.pop('wt_j',None)
         finally: shutil.rmtree(td,ignore_errors=True)
 
 

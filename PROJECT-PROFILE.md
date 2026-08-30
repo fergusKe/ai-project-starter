@@ -83,6 +83,12 @@ Verification exception reason: none
 
 ## Critical user journeys
 - 尚未定義
+<!-- WEB 專案必須改成具穩定 ID 的形式，例如：
+- [J1] 訪客可以瀏覽商品並加入購物車
+- [J2] 已登入使用者可以完成結帳與付款
+ID 一旦指派就不要重用或重編號 —— browser evidence 以 ID 對應結果。
+journeys 屬於被批准內容：它決定 Browser Verification 的範圍，改動會使批准失效。
+非 WEB 專案（API/CLI/LIBRARY…）維持「尚未定義」即可。 -->
 
 ## Repository
 Primary stack: UNKNOWN

@@ -90,7 +90,17 @@ sys.exit(0)
   # start-engineering 會回驗它。少寫這一欄等於假造出一個真實流程不會產生的狀態。
   _,_,_,dg=ws.profile_resolution(self.r)
   assert dg is not None,'e2e fixture 前提：進 approve-spec 之前 profile 必須完全解析'
-  ns=replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by='smoke-human',profile_digest=dg,last_updated=ws.now_iso()) if kind=='spec' else replace(s,test_design_approved='yes',approved_by='smoke-human',last_updated=ws.now_iso())
+  if kind=='spec':
+   # 真正的 approve-spec 同時綁 profile 與 OpenSpec change 內容的 digest。
+   sdg=ws.spec_digest(self.r,'demo')
+   assert sdg is not None,'e2e fixture 前提：openspec/changes/demo 必須存在且非空'
+   ns=replace(s,phase='TEST_DESIGN',spec_approved='yes',approved_by='smoke-human',
+              profile_digest=dg,spec_digest=sdg,last_updated=ws.now_iso())
+  else:
+   tdg=ws.test_design_digest(self.r,'demo')
+   assert tdg is not None,'e2e fixture 前提：workflow/test-cases/demo.md 必須存在'
+   ns=replace(s,test_design_approved='yes',approved_by='smoke-human',
+              test_design_digest=tdg,last_updated=ws.now_iso())
   ws.write_state(self.r/'workflow/STATE.md',ns);h=ws.state_hash_path(self.r/'workflow/STATE.md')
   with (self.r/'workflow/state-log.md').open('a') as f:f.write(f'## smoke\n- Actor: smoke-human\n- Action: approve-{kind}\n- Change: demo\n- From: X\n- To: {ns.phase}\n- Git SHA: SMOKE\n- State hash: {h}\n- Reason: smoke\n\n')
   sys.path.pop(0);sys.modules.pop('workflow_state',None)
@@ -98,6 +108,11 @@ sys.exit(0)
   p=self.r/'PROJECT-PROFILE.md';t=p.read_text().replace('Type: UNKNOWN','Type: WEB_APP' if web else 'Type: API').replace('Web verification required: auto','Web verification required: yes' if web else 'Web verification required: no')
   # 其餘必填欄位也要解析。approve-spec 是收取 profile 定案的邊界，
   # 讓 fixture 停在 UNKNOWN 等於繞過那個邊界去測後面的階段。
+  if web:
+   # WEB 專案必須定義 critical journeys（它們決定 Browser Verification 的範圍，
+   # 並納入被批准的 profile digest）。
+   t=t.replace('## Critical user journeys\n- 尚未定義',
+               '## Critical user journeys\n- [J1] 首頁可載入\n- [J2] 使用者可完成主要流程')
   for a,b in (('Primary stack: UNKNOWN','Primary stack: Node.js'),
               ('Package manager: UNKNOWN','Package manager: npm'),
               ('Monorepo: UNKNOWN','Monorepo: no'),
@@ -117,7 +132,7 @@ sys.exit(0)
  def test_web_disc_to_archive(self):
   self.prep_to_engineering(True);(self.r/'package.json').write_text('{"scripts":{"test":"echo ok","build":"echo build","test:e2e":"mkdir -p playwright-report; echo report > playwright-report/index.html; echo e2e"}}');
   self.assertEqual(run(self.r,'bash','workflow/bin/verify.sh','--full').returncode,0);core=sorted((self.r/'workflow/evidence/demo/core').glob('*.md'))[-1]
-  (self.r/'workflow/evidence/demo/browser.md').write_text(f'# Browser Verification Evidence\nCore evidence: {core.name}\nPlaywright report: playwright-report/index.html\nChrome DevTools MCP: console/network checked; no blocking errors\n')
+  (self.r/'workflow/evidence/demo/browser.md').write_text(f'# Browser Verification Evidence\nCore evidence: {core.name}\nPlaywright report: playwright-report/index.html\nChrome DevTools MCP: console/network checked; no blocking errors\nJ1: PASS\nJ2: PASS\n')
   self.assertEqual(self.cli('verification-pass','demo').returncode,0);self.assertEqual(self.commit_transition('verification').returncode,0);self.assertEqual(self.cli('archive','demo').returncode,0);self.assertIn('Phase: ARCHIVE',(self.r/'workflow/STATE.md').read_text())
  def test_failed_check_records_failure(self):
   self.prep_to_engineering(False);(self.r/'package.json').write_text('{"scripts":{"test":"exit 1","build":"echo build"}}');

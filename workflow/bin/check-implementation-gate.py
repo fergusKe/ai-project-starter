@@ -70,6 +70,22 @@ for c in changes:
 if control:
     fail('Control Plane 變更不可透過一般 commit；請由人類執行 workflow_transition.py control-plane-commit:\n  - '+'\n  - '.join(control),20)
 
+# ARCHIVE 之後，被接受的 evidence 必須凍結。
+# 原本 core/browser evidence 在下面的 product 判定裡被無條件豁免（因為它們由 machine
+# 產生、不算產品程式碼），但那個豁免沒有分階段。結果是 archive 完成後仍可用 shell 或
+# 一般編輯器改 evidence 再單獨 commit，而 STATE 繼續顯示 ARCHIVE、archive 也不能重跑。
+# state-log 裡有 digest 可供人工比對，但沒有任何一般 commit、status 或 CI audit 會去比。
+if s.phase=='ARCHIVE':
+    frozen=[]
+    for c in changes:
+        for pth in c.paths:
+            if CORE_EVIDENCE_RE.match(pth) or BROWSER_EVIDENCE_RE.match(pth):
+                frozen.append(f'{c.status}: '+(' -> '.join(c.paths) if c.status=='R' else pth))
+                break
+    if frozen:
+        fail('ARCHIVE 之後不得修改已封存的 evidence：\n  - '+'\n  - '.join(frozen)
+             +'\n新的一輪請先 start-change；新 change 有自己的 evidence 目錄。',16)
+
 # Determine product impact from every side of a mutation. This prevents renaming product/CP out to an AI-writable destination.
 product=[]
 for c in changes:

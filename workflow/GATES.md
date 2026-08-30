@@ -427,6 +427,76 @@ transition 成功、append-only log 追加一筆，但讀取語意認為沒有 c
 > 因此該鎖的是**訊息內容**，不是擋不擋。這也是一個提醒：冗餘不等於可刪，
 > 但它的測試必須鎖住它真正提供的東西。
 
+## 生命週期必須有第二輪
+
+`start-change` 接受 `DISCOVERY` / `SPECIFICATION` / **`ARCHIVE`**。
+
+原本只接受前兩者，於是做完第一個 change 之後**整個 Starter 沒有合法的第二輪入口**：
+`start-change` 拒絕（exit 34）、`revert-to-spec` 拒絕 ARCHIVE 並叫使用者「請建立新的
+OpenSpec change」（一個做不到的建議）、`set-mode` 只允許 DISCOVERY。而 `AGENTS.md`
+的規範明寫「ARCHIVE 後必須開新 change」。
+
+**這不是安全漏洞，是工具不能用。** 十三輪對抗審查都沒發現，因為所有情境（包含 G4
+冷啟動）都停在 SPEC_REVIEW 之前。安全審查會盯著對手做得到什麼，不會盯著使用者做不到
+什麼 —— 兩種缺陷都要找。
+
+從 ARCHIVE 起新的一輪時：
+- **所有** approval flag 與被批准內容的 digest 都要清掉（少清一個就等於讓新 change
+  繼承上一輪人類的批准）。
+- `Project mode` 保留 —— 那是 repository 屬性，不是 change 屬性。
+- 拒絕沿用剛封存的 change 名，否則新一輪的 evidence 會寫進已封存那一輪的目錄，
+  而 state-log 的兩筆 verification-pass 會指向同一條路徑。
+
+## 批准綁內容：spec 與 test design
+
+第十三輪只對 profile 做了「綁內容不綁旗標」。但 `Spec approved: yes` 與
+`Test design approved: yes` 仍是**裸旗標**，而 `openspec/**` 與 `workflow/test-cases/**`
+都永久列在 AI-writable allowlist 裡。
+
+實測繞過：批准 Spec A（「只做 X，絕不碰付款」）進入 ENGINEERING 後，把 proposal 換成
+Spec B（「直接對外開放付款 API，不做驗證」）、test design 一併換掉，產品 commit 照樣
+放行，STATE 仍顯示兩者已批准。fresh clone 看到「已批准」，而實際內容從未被任何人批准。
+
+`Approved spec digest` 綁 `openspec/changes/<change>/**` 的完整內容，
+`Approved test design digest` 綁 `workflow/test-cases/<change>.md`。
+
+**勾選狀態不計入 digest。** `[x]` 是進度，在 ENGINEERING 期間本來就會更新；算進去會讓
+每打一個勾就撤銷一次人類批准 —— 那不是收緊，是把 gate 變成噪音來源，使用者會學會繞過
+它。任務與案例的**文字**則是被批准內容的一部分，不得改動。這與「勾選不是 gate 憑證」
+是同一條規則的兩面。
+
+digest 必須能區分「缺檔」與「空檔」，否則刪掉檔案就等於通過。
+
+## Critical user journeys 是被批准的**範圍**
+
+journeys 決定 Browser Verification 涵蓋什麼，因此屬於被批准內容，納入 profile digest。
+不納入的話：批准含「結帳、付款」的 profile 之後只在 worktree 改成「首頁」，digest 完全
+不變，於是可以產生一份內容完整性無誤、但驗證範圍從未被批准的 browser evidence。
+
+**browser evidence 的 SHA-256 只證明「這份文字沒被換掉」，不證明它覆蓋了被批准的範圍。**
+因此 WEB 專案的 `browser.md` 必須對每個已批准的 journey 給出 `J<n>: PASS`；缺項或非 PASS
+一律拒絕。
+
+journeys 使用穩定 ID（`- [J1] 描述`）。沒有 ID 就只能比對整段文字，任何排版改動都會變成
+gate 失敗。ID 一旦指派不得重用或重編號。
+
+**能力邊界**：這驗證的是**宣稱**覆蓋了哪些 journey，不驗證它們真的被執行過。誠實執行
+仍是既有的能力邊界。
+
+> 註：PROJECT-PROFILE 在該區段用 HTML 註解放範例。解析前必須先剝掉註解 —— 否則一份
+> 全新的 profile 會憑空「已定義」兩個沒人寫過的 journey，WEB 專案的必填檢查也會被範例
+> 矇混過去。這個 bug 是在寫完功能、讀自己輸出時發現的。
+
+## ARCHIVE 之後 evidence 凍結
+
+core/browser evidence 在 gate 的 product 判定裡被豁免（它們由 machine 產生，不算產品
+程式碼），但那個豁免原本沒有分階段。結果是 archive 完成後仍可用 shell 或一般編輯器改
+evidence 再單獨 commit，而 STATE 繼續顯示 ARCHIVE、`archive` 也不能重跑。state-log 裡
+有 digest 可供人工比對，但沒有任何一般 commit、`status` 或 CI audit 會去比。
+
+ARCHIVE 階段拒絕已封存 evidence 的任何 mutation。新的一輪先 `start-change`，
+新 change 有自己的 evidence 目錄。
+
 ## 測試案例文件的勾選狀態
 
 `workflow/test-cases/<change>.md` 的 `[ ]` / `[x]` 是**給人類閱讀與追蹤用的**，
