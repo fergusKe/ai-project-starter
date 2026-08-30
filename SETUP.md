@@ -11,6 +11,33 @@ Claude Code project skills 位於 `.claude/skills/`。GitHub CI 依實際 stack/
 
 詳細工作規則只以 `AGENTS.md` 為準。
 
+## 人類批准要在哪裡執行
+
+`approve-spec` 與 `approve-tests` **需要真正的 controlling terminal**：
+
+```bash
+python3 workflow/bin/workflow_transition.py approve-spec <change>
+```
+
+| 執行環境 | 可以嗎 |
+|---|---|
+| Terminal.app / iTerm / VS Code 內建終端機 | ✅ |
+| Claude Code 對話框的 `!` 前綴 | ❌ stdin 不是 TTY |
+| 任何 `subprocess` / CI / 腳本 | ❌（這正是重點） |
+
+**這是刻意的。** 那道邊界就是「AI 不能自己批准」的實作 —— 如果程式呼叫也能通過，
+整個 Human Approval 就只是一個可以被腳本填答的表單。
+
+先用 `doctor` 確認你的環境可以批准：
+
+```bash
+python3 workflow/bin/workflow_transition.py doctor | grep 'approve-\*'
+# approve-* 可在此環境執行: YES
+```
+
+能力邊界：TTY 是**已驗證的非互動邊界**，不是不可偽造的人類身分認證。
+團隊情境的真正授權來自 CODEOWNERS + required review，見 `workflow/MERGE-PROTECTION.md`。
+
 
 ### Brownfield 既有 Control Plane
 若專案已追蹤 `.claude/settings.json`、`.claude/hooks/**`、`.githooks/**` 或 `workflow/**`，bootstrap 會在 commit 前停止，不會自動覆蓋。請人工合併、stage 後使用 `python3 workflow/bin/workflow_transition.py adopt-control-plane --dry-run` 檢查，再由人類執行 `adopt-control-plane`。
