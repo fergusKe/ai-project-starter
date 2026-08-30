@@ -831,3 +831,31 @@ PreToolUse hook 非零退出（非 exit 2）**不會阻擋工具呼叫** —— 
 **守衛壞掉必須是拒絕，不是沉默。** 整支 hook 現在包在 try/except 裡，
 任何未預期例外都轉成 deny。
 
+## rc.5 feature freeze
+
+**rc.5 已 sign-off。從這裡開始只做收斂，不新增能力。**
+
+只接受：release blocker 修正、回歸測試、診斷訊息與文件一致性修正。
+**不再新增** evidence 類型、transition、policy vocabulary 或 enforcement layer。
+已明確降為 advisory 的（dependency reproducibility、container release preflight）
+留到下一版重新走完整設計。
+
+理由是一個很乾淨的資料點：API gate 的概念本身合理，但加入**一種新 evidence**
+之後，同時需要接進十一個地方 ——
+
+schema validation、project applicability、ownership、AI write policy、
+local commit gate、server audit、verification provenance、archive replay、
+revert/staleness、guard feedback、acceptance path。
+
+漏掉任何一個，局部測試仍可能全綠。實際上第一次就漏了三個。
+
+**gate 是跨生命週期的功能，不是一個 validator。** 未來要新增 gate，
+先把上面這張 consumer matrix 列出來，再實作，再逐層突變。
+
+### 已知邊界（非阻擋）
+
+`guard-workflow-gate.py` 的 try/except 捕捉不到**檔案語法錯誤與頂層 import 失敗**
+—— 它們發生在 try 之前。要讓 PreToolUse 在所有載入失敗下都 fail-closed，
+需要一層外部 wrapper。這一層明確定位為快速回饋而非 authoritative enforcement，
+權威層是 pre-commit 與 server audit，因此不阻擋 rc.5。
+
