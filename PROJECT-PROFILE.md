@@ -80,6 +80,12 @@ Core verification policy: auto
 
 Custom verification command: none
 Verification exception reason: none
+# custom 的指令從你把它寫進本檔那一刻起，**每一個 commit**（含 Control Plane
+# transition）都會執行它 —— auto 有 pre-commit / full 兩套計畫，custom 只有一條。
+# 而驗證腳本本身是產品程式碼，ENGINEERING 之前不能 commit。
+# 因此指令要寫成「專案完成時有意義、專案還空著時不擋路」，例如：
+#   python3 -m unittest discover -s . -p 'test_*.py'   （沒有測試時 exit 0）
+# 而不是會在缺目錄時報錯的形式。Brownfield 不受影響 —— 驗證入口本來就在 repo 裡。
 
 ## Critical user journeys
 - 尚未定義
